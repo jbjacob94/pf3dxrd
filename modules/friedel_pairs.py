@@ -176,7 +176,7 @@ def search_space(cf, mask, mtth = 5, mI = 1/5, flip_eta_omega=False):
     
     For two-theta, the need for rescaling is related to the fact that 2-theta variations related to
     geometrical offset dx increases with the scattering angle: Δtan(2θ) ∝ dx.tan(2θ).
-    In contrast, the difference in logarithm of tan(2θ) only depends on the geometrical offset dx: Δln(tan(2θ)) ∝ dx. 
+    In contrast, the difference in logarithm of tan(2θ) is more closely related to the geometrical offset dx and depends much less on tan(2θ).  
     
     Args:
     ----------
@@ -209,9 +209,9 @@ def search_space(cf, mask, mtth = 5, mI = 1/5, flip_eta_omega=False):
         eta_n = cf.eta[mask]%360 
         omega_n = cf.omega[mask]%360
     # sum_intensity
-    logI = mtth * np.log10(cf.sum_intensity[mask])
+    logI = mI * np.log10(cf.sum_intensity[mask])
     # two-theta
-    logtth = mI * np.log(np.tan(np.radians(cf.tth[mask])))   
+    logtth = mtth * np.log(np.tan(np.radians(cf.tth[mask])))   
     
     return eta_n, omega_n, logI, logtth
     
