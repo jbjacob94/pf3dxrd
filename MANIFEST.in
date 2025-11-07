@@ -1,3 +1,5 @@
 include README.md
-recursive-include Tutorials
-recursive-include data/SI3
+recursive-include data SI3*
+recursive-include NB_tutorials/cif *.cif
+global_include *.ipynb
+global-exwclude *ipynb_checkpoints
