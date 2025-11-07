@@ -13,7 +13,7 @@ import scipy.spatial
 from scipy.sparse import csr_matrix
 
 from ImageD11 import columnfile, transform
-from pf_3dxrd import utils
+from pf3dxrd import utils
 
 
 
