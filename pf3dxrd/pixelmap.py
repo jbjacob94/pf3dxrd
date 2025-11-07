@@ -17,7 +17,7 @@ import xfab
 
 from orix import data, io, plot as opl, quaternion as oq, vector as ovec
 
-from pf_3dxrd import utils, crystal_structure, peak_mapping
+from pf3dxrd import utils, crystal_structure, peak_mapping
 
 """
 plot scanning 3DXRD outputs on a 2D pixelmap. 
