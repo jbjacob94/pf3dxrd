@@ -22,7 +22,7 @@ import ImageD11.blobcorrector
 
 if '/home/esrf/jean1994b' not in sys.path:
     sys.path.append('/home/esrf/jean1994b')
-from pf_3dxrd import utils, friedel_pairs
+from pf3dxrd import utils, friedel_pairs
 
 
 # UPDATE OPTIONS HERE
