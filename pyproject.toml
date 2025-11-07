@@ -4,12 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pf3dxrd"              # Package name on PyPI
+version = "0.1"
 description = "processing scanning 3D X-ray diffraction data usinfg Friedel Pairs"
 readme = "README.md"
-authors = [
-  { name = "Jean-Baptiste Jacob", email = "jean-baptiste.jacob@esrf.fr" }
-]
-license = { text = "MIT" }
+authors = [{ name = "Jean-Baptiste Jacob", email = "jean-baptiste.jacob@esrf.fr" }]
 requires-python = ">=3.9"
 dependencies = [
   "concurrent.futures",
