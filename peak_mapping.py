@@ -273,7 +273,8 @@ def refine_grains(glist, cf, hkl_tol, nmedian= np.inf, sym = None, return_stats=
     sym : crystal symmetry (orix.quaternion.symmetry.Symmetry object). used to evaluate misorientation between old and new orientation. 
     return_stats: returns list of rotation (angle between old and new crystal orientation) + fraction of peaks retained. Default is True
     """
-
+    
+    stats = {'pkprop':[], 'angle deviation':[], 'mean drlv2':[]}
     prop_indx, ang_dev = [], []
     
     for g in tqdm(glist):
@@ -281,10 +282,10 @@ def refine_grains(glist, cf, hkl_tol, nmedian= np.inf, sym = None, return_stats=
     
         gv = np.transpose([cf.gx[g.pksindx], cf.gy[g.pksindx], cf.gz[g.pksindx]]).copy() 
         N0 = len(gv)  # initial peak number
-        ubi = g.ubi.copy() # keep a copy of old ubi
+        ubi0, u0 = g.ubi.copy(), g.U.copy() # keep a copy of old ubi + u mats
         
         # refine grain ubis
-        for i in range(3):
+        for i in range(2):
             # compute hkl and drlv for each peak
             hkl = np.dot(g.ubi, gv.T)
             hkli = np.round( hkl )
@@ -302,18 +303,126 @@ def refine_grains(glist, cf, hkl_tol, nmedian= np.inf, sym = None, return_stats=
             #fit orientation with clean peaks only
             gv = np.transpose([cf.gx[g.pksindx], cf.gy[g.pksindx], cf.gz[g.pksindx]])
             ImageD11.cImageD11.score_and_refine(g.ubi, gv, tol=1)  # set large hkltol to take all peaks in g.pksindx
-            
-    
+            g.set_ubi(g.ubi)
+
         # compute rotation angle between former and new ubi + prop of peaks retained
-        o = oq.Orientation.from_matrix(g.U, symmetry =sym)  # old orientation
-        o2 = oq.Orientation.from_matrix( xfab.tools.ubi_to_u(ubi), symmetry = sym) # new orientation 
+        o1 = oq.Orientation.from_matrix(u0, symmetry =sym)  # old orientation
+        o2 = oq.Orientation.from_matrix( g.U, symmetry = sym) # new orientation 
         
-        ang_dev.append( o2.angle_with(o, degrees=True)[0] )
-        prop_indx.append( len(g.pksindx) / N0)
-        
+        stats['angle deviation'].append( o2.angle_with(o1, degrees=True)[0] )
+        stats['pkprop'].append( len(g.pksindx) / N0)
+        stats['mean drlv2'].append(drlv2.mean())
         
     if return_stats:
-        return prop_indx, ang_dev
+        return stats
+    
+
+def refine_ubi(gvecs, ubi, hkl_tol):
+    """ 
+    small function to refine lattice vector matrix (ubi) from a set of g-vectors, excluding dodgy peaks (drlv*drlv > hkl_tol)
+    same as refine_px_ubi but without pixel selection for g-vectors
+    """   
+    ubi0 = copy.deepcopy(ubi) # keep a copy of old ubi
+    N0 = len(gvecs)  # initial peak number
+    
+    for i in range(2):
+        # compute hkl and drlv2 for each peak
+        hkl = np.dot(ubi0, gvecs.T)
+        hkli = np.round( hkl )
+        # Error on these:
+        drlv = hkli - hkl
+        drlv2 = (drlv*drlv).sum(axis=0)
+    
+        # filter out dodgy peaks
+        ret = drlv2 < hkl_tol*hkl_tol
+        gvecs = gvecs[ret]
+
+        #fit orientation with clean peaks only
+        ImageD11.cImageD11.score_and_refine(ubi, gvecs, tol=1)  # set large hkltol to take all peaks in selection
+        
+    return ubi, gvecs
+        
+
+
+def refine_px_ubi(cf, xmap, px, UBI_col = 'UBI',U_col = 'U', hkl_tol=0.1, sym = None, kernel_size=1):
+    """ 
+    refine pixel ubi (lattice vector matrix) excluding dodgy g-vectors (drlv*drlv > hkl_tol)
+    
+    Args:
+    -------
+    cf      : ImageD11 columnfile sorted by xyi indices
+    xmap    : Pixelmap object contianing indexing results (UBI column)
+    px      : pixel index (xyi index)
+    hkl_tol : hkl tolerance for peaks
+    sym     : crystal symmetry (orix.quaternion.symmetry.Symmetry object). used to evaluate misorientation between old and new orientation. 
+    kernel_size : n-by-n kernel size around central pixel for peak selection. default is 1. 
+    UBI_col/U_col : (str) UBI/U column names, containing the lattice vector matrices / rotation matrices for each pixel
+    
+    Returns:
+    --------
+    ubi     : refined ubi matrix
+    gvecs   : g-vectors retained
+    gvmask  : boolean mask over cf corresponding to retained g-vectors
+    hkli    : integer hkl indices of retained g-vectors
+    stats   : statistics: mean drlv2, proprtion of g-vecs retained, angle shift (degree) between old and new lattice vector matrix
+    
+    
+    """
+    # select peaks from cf
+    s = pks_from_px(cf.xyi.astype(int), px, kernel_size=kernel_size)
+    gvecs = np.array([cf.gx[s], cf.gy[s], cf.gz[s]]).T
+    
+    # select ubi from xmap
+    try:
+        pxindx = np.argwhere(xmap.xyi == px)[0][0]
+    except IndexError:
+        print('pixel index not found in xmap')
+        return
+    
+    ubi = xmap.get(UBI_col)[pxindx]
+    U0 = xmap.get(U_col)[pxindx]
+    ubi0 = copy.deepcopy(ubi) # keep a copy of old ubi
+    N0 = len(gvecs)  # initial peak number
+        
+    # check ubi is correct
+    try:
+        xfab.tools.ubi_to_u(ubi)
+    except ValueError as e:
+        print(f'px {px}: {e}')
+        stats = {'mean drlv2':np.nan,'pkprop':np.nan, 'angle dev (degree)': np.nan}
+        return ubi, [], s, [], stats
+        
+    # refine grain ubis
+    for i in range(2):
+        # compute hkl and drlv2 for each peak
+        hkl = np.dot(ubi, gvecs.T)
+        hkli = np.round( hkl )
+        # Error on these:
+        drlv = hkli - hkl
+        drlv2 = (drlv*drlv).sum(axis=0)
+    
+        # filter out dodgy peaks
+        ret = drlv2 < hkl_tol*hkl_tol
+        s = s[ret]
+
+        #fit orientation with clean peaks only
+        gvecs = np.transpose([cf.gx[s], cf.gy[s], cf.gz[s]])
+        ImageD11.cImageD11.score_and_refine(ubi, gvecs, tol=1)  # set large hkltol to take all peaks in selection
+    
+        
+    # recompute integer hkl index for retained peak
+    hkli = np.round(np.dot(ubi, gvecs.T))
+    pkprop = len(gvecs)/N0
+    
+    # compute rotation angle between former and new ubi + proportion of peaks retained
+    o = oq.Orientation.from_matrix(U0, symmetry =sym)  # old orientation
+    o2 = oq.Orientation.from_matrix( xfab.tools.ubi_to_u(ubi), symmetry = sym) # new orientation 
+    ang_dev =  o2.angle_with(o, degrees=True)[0]
+    
+    gvmask = s   # alias
+    stats = {'mean drlv2':drlv2.mean(),'pkprop':pkprop, 'angle dev (degree)': ang_dev}
+    
+    return ubi, gvecs, gvmask, hkli, stats
     
 
     
