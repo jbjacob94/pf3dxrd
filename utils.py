@@ -526,9 +526,15 @@ def iradon_recon(cf, obins, ybins, mask=None, doplot=True, weight_by_intensity=T
     
     outsize = sino.shape[0]
     
-    if norm is True:
-        sino = (sino.T/np.nanmax(sino,axis=1)).T
-        sino = np.nan_to_num(sino, nan=0, copy=False)
+    #if norm is True:
+    ycenter = len(ybins)/2 -1
+    if ycenter%1 == 0:
+        bc = int(ycenter)
+        sino[bc,:] = sino[bc,:]/2
+    
+    #print(bcenter)
+    sino = (sino/np.nanmax(sino,axis=0))
+    sino = np.nan_to_num(sino, nan=0, copy=False)
     
     r = skimage.transform.iradon(sino,theta=obins[:-1],output_size = outsize, circle=circle)
     
