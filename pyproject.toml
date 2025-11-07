@@ -10,7 +10,6 @@ readme = "README.md"
 authors = [{ name = "Jean-Baptiste Jacob", email = "jean-baptiste.jacob@esrf.fr" }]
 requires-python = ">=3.9"
 dependencies = [
-  "concurrent.futures",
   "diffpy.structure",
   "Dans_Diffraction",
   "dill",
