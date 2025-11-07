@@ -14,7 +14,6 @@ dependencies = [
   "Dans_Diffraction",
   "dill",
   "ImageD11",
-  "multiprocessing",
   "orix",
   "scipy",
   "tqdm"
