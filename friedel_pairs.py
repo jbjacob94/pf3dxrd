@@ -161,7 +161,7 @@ def select_y_pair(cf, ds, pair_id, is_sorted=False):
 
 def search_space(cf, mask, mtth = 5, mI = 1/5, flip_eta_omega=False):
     """
-    build rescaled 4D search space (eta*, omega*, tth*, I*) in which distance matrix between peaks is computed. 
+    build rescaled 4D search space in (eta*, omega*, tth*, I*) in which friedel pairs will be searched for. 
     
     coordinates are defined as follows:
     eta*   = eta mod 360
@@ -176,22 +176,24 @@ def search_space(cf, mask, mtth = 5, mI = 1/5, flip_eta_omega=False):
     
     For two-theta, the need for rescaling is related to the fact that 2-theta variations related to
     geometrical offset dx increases with the scattering angle: Δtan(2θ) ∝ dx.tan(2θ).
-    In contrast, the difference in logarithm of tan(2θ) is more closely related to the geometrical offset dx and depends much less on tan(2θ).  
+    In contrast, the difference in logarithm of tan(2θ) only depends on the geometrical offset dx: Δln(tan(2θ)) ∝ dx. 
     
     Args:
     ----------
     cf   : input columnfile
     mask : boolean mask of len cf.nrows to select a subset in cf
+
+I don'
+
     mtth : multiplication factor for tth*: defaut is 5.
     mI   : multiplication factor for log I. default is 1/5. 
     
     flip_eta_omega (Bool). If True, eta and omega coordinate are flipped: 
     eta -> (180-eta) mod 360 ; omega -> (180+omega) mod 360. Needed to match friedel pairs in symmetrical scans.
 
-    
     Note : multiplication factors mtth and mI are introduced so that the distance between two peaks in a friedel pair
     scales approximately the same along all dimensions (eta*, omega*, I*, tth*). Default values should be about right,
-    but I guess it can depend on the experimentent (range of peak intensities, max 2theta), so these may need to be adjusted a bit
+    but I guess it can depend on the experiment (range of peak intensities, max 2theta), so these may need to be adjusted a bit
     
     Note 2: Friedel pair that match in eta and omega tends to be better in (eta,omega) than in tth, intensity. Sometimes, adding these 
     two dimensions in the search space seems to just bring additional noise without much gain on pairig quality. In this case, 
@@ -944,7 +946,7 @@ def exclude_singles(cf):
     cf_filtered.sortby('fp_id')
     
     # find fp_id values occurring twice
-    uniqs, ind, cnt = np.unique(cf.fp_id, return_index=True, return_counts=True)
+    uniqs, indx, cnt = np.unique(cf.fp_id, return_index=True, return_counts=True)
     to_keep = np.argwhere(cnt==2).T[0]
     
     uniqs = uniqs[to_keep]
