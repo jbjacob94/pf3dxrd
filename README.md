@@ -5,7 +5,7 @@
 This repository contains tools to process scanning 3D X-ray diffraction (3DXRD) data on a per-pixel basis, based on the relocation of diffracted X-rays in the sample using Friedel pairs following the method described in [Jacob et al. 2024](https://doi.org/10.1107/S1600576724009634). Symetric reflections **(h,k,l)**, **(-h,-k,-l)** arising from the same spot in a crystal are identified and paired together. The symmetry properties of these pairs are used to correct the diffraction angle (2-theta) and relocate the center-of-mass of the diffracting region in the sample. Friedel pairs source centers are then mapped onto a 2D pixel grid, which allows per-pixel fitting of crystallographic phase and lattice vectors (local indexing). 
 
 The pf3dxrd package is built upon ImageD11 ([FABLE-3DXRD/ImageD11](https://github.com/FABLE-3DXRD/ImageD11)) and contains the following modules:
-### modules
+### pf3dxrd
 - friedel_pairs.py: Friedel pairs identification and geometry corrections allowing diffractiion vector (g-vector) fitting and diffracting source relocation
 - crystal_structure.py: A class to store crystal structure information, loaded from a cif file
 - grain_stress_fit.py: strain and stress calculation using the EpsSigSolver from ImageD11.stress 
