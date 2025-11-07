@@ -1,0 +1,3 @@
+include README.md
+recursive-include Tutorials
+recursive-include data/SI3
