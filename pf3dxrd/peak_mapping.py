@@ -7,7 +7,7 @@ import ImageD11.columnfile, ImageD11.grain, ImageD11.refinegrains, ImageD11.cIma
 import xfab
 from orix import quaternion as oq
 
-from pf_3dxrd import utils, crystal_structure, pixelmap
+from pf3dxrd import utils, crystal_structure, pixelmap
 
 
 
