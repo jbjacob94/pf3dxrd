@@ -1,1 +1,6 @@
 data/* filter=lfs diff=lfs merge=lfs -text
+.ipynb_checkpoints/* merge=ours diff=none
+*.ipynb_checkpoints merge=ours diff=none
+
+# Ignore temporary notebook autosaves
+**/.ipynb_checkpoints/** filter=lfs diff=none merge=ours
