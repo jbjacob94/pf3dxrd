@@ -26,7 +26,7 @@ import ImageD11.sym_u
 if '/home/esrf/jean1994b/' not in sys.path:
     sys.path.append('/home/esrf/jean1994b/')    
 
-from pf3dxrd import utils, friedel_pairs, pixelmap, crystal_structure, peak_mapping
+from pf3dxrd.pf3dxrd import utils, friedel_pairs, pixelmap, crystal_structure, peak_mapping
 
 
 # UPDATE OPTIONS HERE
