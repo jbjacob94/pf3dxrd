@@ -4,8 +4,7 @@ import concurrent.futures, multiprocessing
 import numpy as np, pylab as pl
 
 import ImageD11.refinegrains, ImageD11.columnfile, ImageD11.parameters
-
-from pf3dxrd import utils, peak_mapping, crystal_structure, pixelmap
+from pf3dxrd.pf3dxrd import utils, peak_mapping, crystal_structure, pixelmap
 
 
 class PhaseMapper:

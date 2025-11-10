@@ -3,8 +3,7 @@ import numpy as np
 from tqdm import tqdm
 
 import ImageD11.grain, ImageD11.stress
-
-from pf3dxrd import pixelmap, crystal_structure
+from pf3dxrd.pf3dxrd import pixelmap, crystal_structure
 
 
 

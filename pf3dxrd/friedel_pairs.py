@@ -13,7 +13,7 @@ import scipy.spatial
 from scipy.sparse import csr_matrix
 
 from ImageD11 import columnfile, transform
-from pf3dxrd import utils
+from pf3dxrd.pf3dxrd import utils
 
 
 
@@ -237,7 +237,7 @@ def search_space_normalized(cf, mask, flip_eta_omega=False):
     See also: search_space
     
     Note: Using the normalized search space yields weird results. I suspect it gives too much importance to tth and Intensity.
-    Hence, unrealistic pair matches are found between peaks very far from each other (>>1°) in eta and omega. 
+    Hence, unrealistic pair matchs are found between peaks very far from each other (>>1°) in eta and omega. 
     """
     if mask is None:
         mask = np.full(cf.nrows, True)
