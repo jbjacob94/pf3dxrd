@@ -30,11 +30,13 @@ from pf3dxrd.pf3dxrd import utils, friedel_pairs, pixelmap, crystal_structure, p
 ######################################################################
 
 class Options():
-    hkltol         = 0.15   #  hkl tolerance parameter for indexing
+    hkltol1        = 0.10   #  hkl tolerance parameter for indexing
+    hkltol2        = 0.05   # hkl tolerance parameter for refinement
     minpks         = 10     # minimum number of g-vectors to consider a ubi as a possible match
+    maxpks         = 5000   #cutoff value for peaks nb for 1st-round indexing
     minpks_prop    = 0.1    # min. frac. of g-vecs over the selected pixel to consider a ubi as a possible match.
     nrings         = 10      # maximum number of hkl rings to search in 
-    max_mult       = 12     # maximum multplicity of hkl rings to search in
+    max_mult       = 12     # maximum multiplicity of hkl rings to search in
     px_kernel_size = 3      # size of peak selection around a pixel: single pixel or nxn kernel
     sym            = ImageD11.sym_u.monoclinic_b()   # crystal symmetry (ImageD11.sym_u symmetry)
     ncpu           = len(os.sched_getaffinity( os.getpid() )) - 1     # ncpu. by default, use all cpus available
@@ -99,12 +101,14 @@ def pixel_ubi_fit( args ):
     # extract keyword arguments
     unitcell    = OPTS.unitcell      # crystal unit cell to pass to ImageD11.indexer
     symmetry    = OPTS.sym           # crystal symmetry (ImageD11.sym_u symmetry) to find unique orientations
-    hkltol      = OPTS.hkltol        # hkl tolerance parameter for indexing (see ImageD11.indexing)
+    hkltol1     = OPTS.hkltol1       # hkl tolerance parameter for indexing (see ImageD11.indexing)
+    hkltol2     = OPTS.hkltol2       # hkl tolerance parameter for refinement
     minpks      = OPTS.minpks        # minimum number of g-vectors to consider a ubi as a possible match (see ImageD11.indexing)
     minpks_prop = OPTS.minpks_prop   # minimum fraction of g-vectors over the selected pixel to consider a ubi as a possible match.
     max_mult    = OPTS.max_mult      # maximum multplicity of hkl rings in which possible orientation match will be searched. 
     nrings      = OPTS.nrings        # maximum number of hkl rings to search in 
     ks          = OPTS.px_kernel_size # size of peak selection around a pixel: single pixel or kernel selection
+    maxpks      = OPTS.maxpks       # max nb of g-vectors to keep for first stage indexing. Refinement is then done using all peaks
     
     
     default_output = px, np.zeros((3,3)), 0, 0  # default output returned if no ubi is found: px, ubi, nindx, drlv2
@@ -113,16 +117,20 @@ def pixel_ubi_fit( args ):
     s = peak_mapping.pks_from_px(to_index.xyi, px, kernel_size=ks)
     if len(s) == 0:
         return default_output
-    
+        
+    # subset gv for first indexing: take the N-strongest gvecs only. 
+    p = min(maxpks/len(s),1) * 100
+    cut = to_index.sum_intensity[s] >= np.percentile(to_index.sum_intensity[s],100-p)
+
     
     # prepare indexer
     ###########################################################################
-    gv = np.array( (to_index.gx[s],to_index.gy[s],to_index.gz[s])).T.copy()
+    gvecs = np.array( (to_index.gx[s],to_index.gy[s],to_index.gz[s])).T.copy()
     ImageD11.indexing.loglevel=10  # loglevel set to high value to avoid outputs from indexer
     ind = ImageD11.indexing.indexer( unitcell = unitcell,
-                                     gv = gv,
+                                     gv = gvecs[cut],
                                      wavelength=to_index.parameters.get('wavelength'),
-                                     hkl_tol= hkltol,
+                                     hkl_tol= hkltol1,
                                      cosine_tol = np.cos(np.radians(90-1.)),
                                      ds_tol = 0.005,
                                      minpks = max(minpks, len(gv) * minpks_prop),
@@ -178,7 +186,7 @@ def pixel_ubi_fit( args ):
     
     # compute scores for all ubis found
     for i,ubi in enumerate(ind.ubis):
-        sc = ImageD11.cImageD11.score_and_refine( ubi, gv, hkltol ) 
+        sc = ImageD11.cImageD11.score_and_refine( ubi, gvecs, hkltol2 ) 
         scores.append(sc)
         scoreproduct.append(sc[0]/sc[1])
         nindx.append(sc[0])
@@ -188,10 +196,11 @@ def pixel_ubi_fit( args ):
         return default_output
     # select the best ubi: highest scoreproduct
     nindx = [sc[0] for sc in scores]
-    best_score = scores[np.argmax(nindx)]
-    best_ubi = ubis[np.argmax(nindx)]
+    best_indx =  np.argmax(scoreproduct)
+    best_score, best_ubi = scores[best_indx], ubis[best_indx]
     
     return px, best_ubi, best_score[0], best_score[1]
+
 
 
 
