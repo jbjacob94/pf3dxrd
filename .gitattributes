@@ -1,1 +1,8 @@
 data/ filter=lfs diff=lfs merge=lfs -text
+data/SI3 filter=lfs diff=lfs merge=lfs -text
+data/SI3/SI3.par filter=lfs diff=lfs merge=lfs -text
+data/SI3/frelon21_mar16.spline filter=lfs diff=lfs merge=lfs -text
+data/SI3/SI3_DT360Z5480_dataset.h5 filter=lfs diff=lfs merge=lfs -text
+data/SI3/SI3_DT360Z5480_pks.h5 filter=lfs diff=lfs merge=lfs -text
+data/SI3/SI3_DT360Z5480_pks_p.h5 filter=lfs diff=lfs merge=lfs -text
+data/SI3/SI3_DT360Z5480_xmap.h5 filter=lfs diff=lfs merge=lfs -text
