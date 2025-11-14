@@ -676,8 +676,10 @@ def merge_outputs(out, cf = None, doplot=True, saveplot=False):
 # Geometry correction
 ##############################################################
         
-def update_geometry_s3dxrd(cf, ds, update_gvecs=True):
-    """ update peakfile geometry using friedel pairs. Works for scanning 3dxrd data (pencil-beam + dy translations).
+def update_geometry_s3dxrd(cf, ds=None, update_gvecs=True):
+    """ use friedel pair coordinates to relocate the source of the diffracting region in the sample and correct the two-theta offset on the detector.
+    Details in Jacob et al. 2024, Exploiting Friedel pairs to interpret scanning 3DXRD data from complex geological materials
+    https://doi.org/10.1107/S1600576724009634 
     
     Adds new columns to the peakfile cf:
     - tthc : corrected two-theta
@@ -688,37 +690,8 @@ def update_geometry_s3dxrd(cf, ds, update_gvecs=True):
     Args:
     ---------
     cf : ImageD11 columnfle containing friedel pairs
-    ds : ImageD11 dataset object 
+    ds : (optional)  ImageD11.sinogram.?dataset. contain detector information. If None, assume eiger detector
     update_gvecs (bool) : if True, g-vectors coordinates (gx,gy,gz) are also updated. Default if True
-    
-
-    Details:
-    If a grain is not positioned on the centre of rotation of the sample, it results in an offset t(dx,dy,dz)
-    of the diffraction vector arising from this grain. This offset results in variations of the azimutal and 
-    scattering angle (eta, two-theta) which are not related to the d-spacing or the orientation of the lattice.
-    
-    Traditionally, this offset if determined (alongside with corrected eta and 2-theta) during a refinment process after indexing.
-    However, Friedel pairs properties allow to do the correction before indexing. Furthermore, it allows to relocate the origin 
-    of the diffraction vector in the sample reference frame, which can then be used to do point-by-point fitting of the lattice.
-    
-    Principle (in brief):
-    In a scanning 3dxrd experiment, the size of the thin pencil beam in y and z is small. This, it can be considered that
-    the offset from the rotation center only occurs parallel to the beam, ie in the x-direction, and offset in y and z is negligible. 
-    This implies that only the 2-theta angle (tth) is affected by the offset, not eta.
-    
-    We also know the offset in the y-direction dy, which is basically the translation dty of a given scan,
-    stored in the dty column of the peakfile. With these assumptions, we find that for two peaks (p1,p2) forming a Friedel pair:
-    
-    * tth_cor = 1/2.(tan1 + tan2) 
-    * dx = L * (tan1-tan2)/(tan1+tan2)
-    
-    where tan1 and tan2 are respectively tan(tth1) and tan(tth2) of p1 and  p2 and L is the distance of the detector
-    from the rotation center. tth_cor is the real scattering angle, not affected by the grain offset, and dx is the offset along the 
-    beam direction (x-axis). xs and ys coordinates are then obtained from dx and dy by applying a back rotation of angle omega:
-    
-    (xs,ys) = R.(dx,dy), where R is the oration matrix of angle omega
-    
-    See related publication for more detail. 
     """
     
     # check that friedel pairs have been labeled and that the columnfile is not corrupted, extract fp_ids and fp_dist and reshape them 
@@ -730,12 +703,14 @@ def update_geometry_s3dxrd(cf, ds, update_gvecs=True):
     cf.sortby('fp_id') # sort by fp label
     
     # define masks to split data into two twin columnfiles, each containing one item of each pair
-    m1 = np.arange(0, cf.nrows, 2)
-    m2 = np.arange(1, cf.nrows, 2)
+    #m1 = np.arange(0, cf.nrows, 2)
+    #m2 = np.arange(1, cf.nrows, 2)
     
     # check all fp_ids and fp_dist match
-    assert np.all(np.equal(cf.fp_id[m1],cf.fp_id[m2]))
-    assert np.all(np.equal(cf.fp_dist[m1], cf.fp_dist[m2]))
+    #assert np.all(np.equal(cf.fp_id[m1],cf.fp_id[m2]))
+    #assert np.all(np.equal(cf.fp_dist[m1], cf.fp_dist[m2]))
+    assert np.all(np.equal(cf.fp_id[::2],cf.fp_id[1::2]))
+    assert np.all(np.equal(cf.fp_dist[::2], cf.fp_dist[1::2]))
     
     
     # compute corrected tth + (xs,ys) peak position in sample space
@@ -746,17 +721,17 @@ def update_geometry_s3dxrd(cf, ds, update_gvecs=True):
     
     # tth correction
     #################
-    tan1  = np.tan(np.radians(cf.tth[m1]))
-    tan2  = np.tan(np.radians(cf.tth[m2]))
+    tan1  = np.tan(np.radians(cf.tth[::2]))
+    tan2  = np.tan(np.radians(cf.tth[1::2]))
     tth_cor = np.degrees(np.arctan( (tan1 + tan2)/2 ) ) 
     ds_cor = 2 * np.sin(np.radians(tth_cor)/2) / wl      # 1/d-spacing
     
     # compute (dx, dy): distance of peak from rot center along x and y axes, in lab reference frame
     ##################
-    dy = (cf.dty[m1] - cf.dty[m2]) / 2
+    dy = (cf.dty[::2] - cf.dty[1::2]) / 2
     
-    if 'frelon' in ds.detector:  # dty is given in mm with the Frelon, so we convert distance to mm 
-        L  = L/1000    
+    if ds is not None and 'frelon' in ds.detector:
+        L  = L/1000    # dty is given in mm with the Frelon, so we convert distance to mm 
     dx = L * (tan1-tan2)/(tan1+tan2)  
     
     # rearrange dx, dy arrays
@@ -767,13 +742,13 @@ def update_geometry_s3dxrd(cf, ds, update_gvecs=True):
     # compute (xs,ys): peak origin in sample reference frame
     ##################
     o = np.radians(cf.omega)
-    o[m2] = (o[m2]-np.pi)%(2*np.pi)  # rotate omega by 180° for the second half of the data
+    o[1::2] = (o[1::2]-np.pi)%(2*np.pi)  # rotate omega by 180° for the second half of the data
     co,so = np.cos(o), np.sin(o)
 
     # omega can be slightly different between two paired peaks -> would lead to different xs,ys, which causes issues later in the processing
     # for each pair, take average value of omega and assign it to both peaks 
-    co = utils.recast((co[m1]+co[m2])/2)
-    so = utils.recast((so[m1]+so[m2])/2)
+    co = utils.recast((co[::2]+co[1::2])/2)
+    so = utils.recast((so[::2]+so[1::2])/2)
     xs = co*dx + so*dy
     ys = -so*dx + co*dy
     
@@ -911,25 +886,12 @@ def split_fpairs(cf):
     
     Returns:
     c1, c2: splitted columnfiles, each containing one element of each fridel pair.
-    
     c1.nrows = c2.nrows = 1/2 * cf.nrows
     """
-    
-    cf.sortby('fp_id') # sort by fp label
-    
-    # define masks to split data into two twin columnfiles, each containing one item of each pair
-    m = np.arange(cf.nrows)%2 == 0
-    
-    # check that splitting is ok
-    assert np.all(np.equal(cf.fp_id[m],cf.fp_id[~m]))
-    assert np.all(np.equal(cf.fp_dist[m],cf.fp_dist[~m]))
-    
-    # filter peaks
-    c1 = cf.copy()
-    c1.filter(m)
-    c2 = cf.copy()
-    c2.filter(~m)
-    
+    cf.sortby('fp_id')  # soirt by friedel pair index
+    cols = cf.titles
+    c1 = columnfile.colfile_from_dict({t:cf.getcolumn(t)[::2] for t in cols})
+    c2 = columnfile.colfile_from_dict({t:cf.getcolumn(t)[1::2] for t in cols})
     return c1, c2
 
 

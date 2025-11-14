@@ -392,7 +392,7 @@ def refine_px_ubi(cf, xmap, px, UBI_col = 'UBI',U_col = 'U', hkl_tol=0.1, sym = 
         stats = {'mean drlv2':np.nan,'pkprop':np.nan, 'angle dev (degree)': np.nan}
         return ubi, [], s, [], stats
         
-    # refine grain ubis
+    # refine ubis
     for i in range(2):
         # compute hkl and drlv2 for each peak
         hkl = np.dot(ubi, gvecs.T)
