@@ -12,6 +12,7 @@ env/
 
 # Ignore local data files
 data/
+sandbox/
 *.h5
 *.csv
 
