@@ -20,9 +20,12 @@ import ImageD11.parameters
 import ImageD11.sparseframe
 import ImageD11.blobcorrector
 
-if '/home/esrf/jean1994b' not in sys.path:
-    sys.path.append('/home/esrf/jean1994b')
-from pf3dxrd import utils, friedel_pairs
+# workaround to add pf3dxrd folder to sys.path from the batch script
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
+if project_root not in sys.path:
+    sys.path.append(project_root)
+
+from pf3dxrd.pf3dxrd import utils, friedel_pairs
 
 
 # UPDATE OPTIONS HERE

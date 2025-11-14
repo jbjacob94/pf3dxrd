@@ -22,10 +22,7 @@ import ImageD11.grain
 import ImageD11.sym_u
 
 
-# point-fit 3dxrd module available at https://github.com/jbjacob94/pf_3dxrd.
-if '/home/esrf/jean1994b/' not in sys.path:
-    sys.path.append('/home/esrf/jean1994b/')    
-
+# pf3dxrd module available at https://github.com/jbjacob94/pf_3dxrd.
 from pf3dxrd.pf3dxrd import utils, friedel_pairs, pixelmap, crystal_structure, peak_mapping
 
 
