@@ -677,7 +677,9 @@ def merge_outputs(out, cf = None, doplot=True, saveplot=False):
 ##############################################################
         
 def update_geometry_s3dxrd(cf, ds=None, update_gvecs=True):
-    """ use friedel pair coordinates to relocate the source of the diffracting region in the sample and correct the two-theta offset on the detector.
+    """ 
+    DEPRECATED. Replaced 'update_geometry_fpairs'
+    use friedel pair coordinates to relocate the source of the diffracting region in the sample and correct the two-theta offset on the detector.
     Details in Jacob et al. 2024, Exploiting Friedel pairs to interpret scanning 3DXRD data from complex geological materials
     https://doi.org/10.1107/S1600576724009634 
     
@@ -702,13 +704,7 @@ def update_geometry_s3dxrd(cf, ds=None, update_gvecs=True):
     
     cf.sortby('fp_id') # sort by fp label
     
-    # define masks to split data into two twin columnfiles, each containing one item of each pair
-    #m1 = np.arange(0, cf.nrows, 2)
-    #m2 = np.arange(1, cf.nrows, 2)
-    
     # check all fp_ids and fp_dist match
-    #assert np.all(np.equal(cf.fp_id[m1],cf.fp_id[m2]))
-    #assert np.all(np.equal(cf.fp_dist[m1], cf.fp_dist[m2]))
     assert np.all(np.equal(cf.fp_id[::2],cf.fp_id[1::2]))
     assert np.all(np.equal(cf.fp_dist[::2], cf.fp_dist[1::2]))
     
@@ -769,109 +765,123 @@ def update_geometry_s3dxrd(cf, ds=None, update_gvecs=True):
                                                           chi   = cf.parameters.get('chi'))
 
         
-        
-        
-def update_geometry_boxbeam_3dxrd(cf):
+
+def update_geometry_fpairs(cf, add_xyz_lab=False, relocate_fpairs=True):
     """
-    update peakfile geometry using friedel pairs, in the case of a regular 3dxrd acquisition
-    (box beam or letter-box beam)
-    
-    Adds new columns to the peakfile cf:
-    - xl_c, yl_c, zl_c : corrected coordinates for the diffraction vector in the laboratory reference frame
-    - tth_c, eta_c : corrected scattering angle and azimutal angle for the diffraction vector
-    - g-vectors coordinates (gx,gy,gz) are also updated 
-    
-    Details:
-    If a grain is not positioned on the centre of rotation of the sample, it results in an offset t(dx,dy,dz)
-    of the diffraction vector arising from this grain. This offset results in variations of the azimutal and 
-    scattering angle (eta, two-theta) which are not related to the d-spacing or the orientation of the lattice.
-    
-    Visualizing the problem with cartesian coordinates in the lab reference frame (xl, yl, zl) while considering the
-    full experimental setup (beam + detector) rotating around the sample during a scan makes it easier to understand.
-    In this setup, the peaks forming a Friedel pair (p1 and p2) and the grains they originate from are aligned, regardless
-    of the grain's position in the sample. The orientation of the line (p1p2) is only determined by the lattice spacing and
-    orientation of the grain. Therefore, the coordinates of the "true" diffraction vector are obtained by halving the vector
-    from p2 to p1. Considering the actual experimental setup where the detector remains fixed while the sample rotates, this
-    yields the following coordinates for the corrected diffraction vector (xl,yl,zl) in the laboratory reference frame:
-    
-    xl = 1/2 . (xl1 + xl2)
-    yl = 1/2 . (yl1 + yl2)
-    zl = 1/2 . (zl1 - zl2)
-    
-    the symmetric reflection (-h,-k,-l) is then (xl, yl, -zl) When these values have been calculated, tth and eta can be computed using
-    ImageD11.transform.compute_tth_eta_from_xyz.
-    
-    
-    Note: 
-    In a standard 3DXRD acquisition (unlike scanning 3DXRD), the dimensions of the beam in y and z directions 
-    cannot be neglected. Consequently, the offset vector t(dx, dy, dz) has three unknowns, and both 2-theta and
-    eta require correction. Unfortunately, it is not possible to solve all these parameters with just the two
-    peaks in a Friedel pair. While 2-theta and eta can be determined, solving for the translation 
-    vector t(dx, dy, dz) leaves the system of equations underdetermined, with one degree of freedom remaining.
-    Therefore, the positions of grains in the sample are adjusted later, using all the indexed peaks for each grain.
+    Update diffraction geometry for (scanning)-3DXRD data using Friedel-pairs (omega-pair) symmetry correction:
+    similar to cf.updateGeometry() but uses Friedel-pairs to correct for the offset from rotation-center.
+
+    Two tasks are performed:
+    1. **Geometry update** (always). Update the geometry columns in the ColumnFile:
+    Always added:
+        - 'tth', 'eta', 'ds', 'gx', 'gy', 'gz'
+    If ``add_xyz_lab=True``:
+        - 'xl', 'yl', 'zl'
+
+    2. **Source relocation ** (if ``relocate_fpairs=True``):
+       Compute diffracted beam origin in sample frame using paired peaks.
+       Adds the following columns to cf:
+         - `'xs'` and `'ys'`: sample coordinates of relocated peaks
+         - `'r_dist'`: radial offset distance from rotation center
+
+    Parameters
+    ----------
+   -  cf : ImageD11 ColumnFile 
+   -  add_xyz_lab : bool, optional. Add corrected lab-frame coordinates to cf
+   -  relocate_fpairs : bool, optional. If True, performs source-origin relocation
+
+    Notes
+    -----
+    • Input columnfile must contain even-numbered Friedel-pair ordering along rows:
+      rows `0,1` form a pair, `2,3` a pair, etc.  
+      No call to ``cf.updategeometry()`` is required beforehand.
+
+    • Originally developped for scanning-3DXRD. Friedel pair correction should also work with
+    box-beam 3DXRD (NOT TESTED), but relocation works only for scanning-3DXRD. Box-beam geometry has two
+    extra degrees there is of freedom which makes relocation impossible with just two peaks in a pair. 
+    Using the four omega-eta pairs should allow to solve the relocation problem for box-beam experiments
+
+    • Details in Jacob et al. 2024, "Exploiting Friedel pairs to interpret scanning 3DXRD data from complex
+    geological materials" https://doi.org/10.1107/S1600576724009634 
     """
-    cf.sortby('fp_id')
     
-    # get lab coordinates without detector tilt
-    #############################################
+    # parameters
+    if cf.parameters is None:
+        cf.setparameters( pars )
+    pars = cf.parameters
+    assert "omega" in cf.titles, 'no omega column'
+    if "sc" in cf.titles and "fc" in cf.titles:
+            sc, fc = cf.sc, cf.fc
+    elif "xc" in cf.titles and "yc" in cf.titles:
+            sc, fc = cf.xc, cf.yc
+    else:
+        raise Exception("columnfile file misses xc/yc or sc/fc")
+   
+    comp = transform.Ctransform(pars.parameters)
     
-    # replace raw pixel coordinates by corrected coordinates
-    cf2 = cf.copy()
-    cf2.s_raw = cf2.sc
-    cf2.f_raw = cf2.fc
+    # compute peak coords in lab space 
+    xyz_non_corr = comp.sf2xyz(sc, fc)
+
+    # FRIEDEL PAIR CORRECTION
+    # Back-rotate half of the peaks to give a more intuitive geometry where paired peaks are aligned with the diffraction source origin
+    R = np.diag([-1,-1,1])     
+    xyz_corr = 1/2 * (xyz_non_corr[::2] - xyz_non_corr[1::2].dot(R))
+   
+    # merge arrays to go back to original colf size
+    xyz_corr_full = np.full( (cf.nrows, 3), 1, dtype=xyz_non_corr.dtype)
+    xyz_corr_full[::2] = xyz_corr
+    xyz_corr_full[1::2] = xyz_corr.dot(-R)
+    del xyz_corr
     
-    # reset tilt and wedge parameters and run updadeGeometry()
-    pars = deepcopy(cf_paired.parameters)
-    pars.parameters['tilt_x'] = 0
-    pars.parameters['tilt_y'] = 0
-    pars.parameters['tilt_z'] = 0
-    pars.parameters['wedge']  = 0
+    # compute geometry with corrected peaks
+    out_non_corr = comp.xyz2geometry( xyz_non_corr, cf.omega, tx=0, ty=0, tz=0)  # needed for source relocation
+    tth_non_corr = out_non_corr[:,0]
+    del out_non_corr
     
-    cf2.setparameters(pars)
-    cf2.updateGeometry()
+    out = comp.xyz2geometry( xyz_corr_full, cf.omega, tx=0, ty=0, tz=0 )
+    for i,name in enumerate(("tth", "eta", "ds", "gx", "gy", "gz")):
+        cf.addcolumn( out[:,i], name )
+    if add_xyz_lab:
+        for i,name in enumerate(['xl','yl','zl']):
+            cf.addcolumn( xyz_corr_full[:,i], name )
+
+    if not relocate_fpairs:
+        return
+
+    # SOURCE RELOCATION IN LAB FRAME: find shift (dx,dy) from rotation centre
+    # for robustness, use friedel pair average for omega and dy distance from rot center to make sure both peaks are relocated to the same coordinates    
+    # shift along x-axis: easier to compute in tth-eta space
+    tantth1  = np.tan(np.radians(tth_non_corr[::2]))
+    tantth2  = np.tan(np.radians(tth_non_corr[1::2]))
+
+    xl = xyz_corr_full[::2,0]
+    dx = np.sign(xl) * xl * (tantth1-tantth2)/(tantth1+tantth2)
+    dx = utils.recast(dx)
     
-    c1, c2 = friedel_pairs.split_fpairs(cf2)  # peak coordinates (xl,yl,zl) assuming no detector tilt
+    # shift along y-axis given by motor position
+    dy = (cf.dty[::2] - cf.dty[1::2]) / 2  # for robustness, take average distance alo,ng y and assign it to both peaks
+    dy = utils.recast(dy)
     
-    del cf2  # not needed anymore
+    # euclidian distance from rotation center in sample coordinates
+    r_dist = np.sqrt(dx**2 + dy**2)  
     
-    
-    # compute corrected diffraction vector v
-    ##############################################
-    # apparent diffraction vectors (v1,v2) in lab coordinates. Both can be described as the sum of the true diffraction vector +  some offset (dx,dy,dz)
-    xl1, yl1, zl1 = c1.xl, c1.yl, c1.zl
-    xl2, yl2, zl2 = c2.xl, c2.yl, c2.zl
-    
-    # corrected diffraction vector in lab coordinates
-    x = (xl1 + xl2) / 2  #  take average for sanity, but xl1 and xl2 should be equal since xli,yli,zli have been corrected for detector tilt
-    y = (yl1 + yl2) / 2
-    z = (zl1 - zl2) / 2
-    
-    # build lab coordinate arrays for both peaks in each friedel pairs: p(hkl)-> (x,y,z); p'(-h-k-l) -> (x,y,-z) 
-    x_c = utils.recast(x)
-    y_c = utils.recast(y)
-    z_c = np.concatenate((z,-z)).reshape((2,len(z))).T.reshape((2*len(z)))
-    
-    # compute corrected values in peakfile: lab coordinates, (tth,eta) and g-vectors
-    ###############################################
-    
-    # lab coordinates
-    cf.addcolumn(x_p, 'xl_c')
-    cf.addcolumn(y_p, 'yl_c')
-    cf.addcolumn(z_p, 'zl_c')
-    
-    # tth-eta coordinates
-    tth_c, eta_c = ImageD11.transform.compute_tth_eta_from_xyz(np.array([x_c, y_c, z_c]), omega=cf.omega)
-    cf.addcolumn(tth_c, 'tth_c')
-    cf.addcolumn(eta_c, 'eta_c')
-    
-    # g-vectors
-    gx, gy, gz = ImageD11.transform.compute_g_vectors(cf.tth_c, cf.eta_c, cf.omega,
-                                                                          wvln  = cf.parameters.get('wavelength'),
-                                                                          wedge = cf.parameters.get('wedge'),
-                                                                          chi   = cf.parameters.get('chi'))
-    cf.addcolumn(gx, 'gx')
-    cf.addcolumn(gy, 'gy')
-    cf.addcolumn(gz, 'gz')
+    # CONVERSION TO SAMPLE FRAME: rotate peak coords in sample reference frame (xs,ys).
+    # use averaged omega values to make sure paired peaks are relocated to the same spot    
+    o = np.radians(cf.omega)
+    o[1::2] = (o[1::2]-np.pi)%(2*np.pi)  # rotate omega by 180° for the second half of the data to match with dy
+    co,so = np.cos(o), np.sin(o)
+
+    # use averaged omega values to make sure paired peaks are relocated to the same spot 
+    co = utils.recast((co[::2]+co[1::2])/2)
+    so = utils.recast((so[::2]+so[1::2])/2)
+    xs = co*dx + so*dy
+    ys = -so*dx + co*dy
+
+    # add data columns 
+    cf.addcolumn(xs, 'xs')
+    cf.addcolumn(ys, 'ys')
+    cf.addcolumn(r_dist, 'r_dist')
+
     
     
     

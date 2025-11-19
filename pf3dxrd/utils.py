@@ -17,7 +17,7 @@ def colf_to_hdf( colfile, hdffile, save_mode='minimal', name=None, compression='
     
         """
         Saves columnfile to hdf5. Updated from ImageD11.columnfile.colfile_to_hdf to make sure new data columns introduced in
-        different modules of pf_3dxrd are saved properly.
+        different modules of pf3dxrd are saved properly.
         
         Args:
         ---------
