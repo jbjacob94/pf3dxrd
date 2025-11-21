@@ -1,5 +1,6 @@
 import os, sys, copy, h5py, tqdm
 import numpy as np, pylab as pl
+import subprocess
 
 from matplotlib_scalebar.scalebar import ScaleBar
 import matplotlib.cm as cm, matplotlib.colors as mcolors
@@ -298,11 +299,11 @@ class Pixelmap:
 
     # methods
     ###########################################################################
-    def add_data(self, data, dname):
+    def add_data(self, data, datacolname):
         """ add a data column to pixelmap.
         preferentially use numpy array or ndarray of shape(nx*ny,n), but lists may work as well"""
         assert len(data) == self.grid.nx * self.grid.ny
-        setattr(self, dname, data)
+        setattr(self, datacolname, data)
         
         
         
@@ -325,21 +326,21 @@ class Pixelmap:
         return pxmap_new
     
     
-    def update_pixels(self, xyi_indx, dname, newvals, debug=0):
-        """ update data column dname with new values for a subset of pixel selected by xyi indices, without touching other pixels
+    def update_pixels(self, xyi_indx, datacolname, newvals, debug=0):
+        """ update data column datacolname with new values for a subset of pixel selected by xyi indices, without touching other pixels
         
         Args:
         ---------
         xyi_indx: list of xyi index of pixels to update
-        dname: name of the data column to update
+        datacolname: name of the data column to update
         newvals: array of new values. Must have same length as xyi_indx"""
         
-        assert dname in self.__dict__.keys()
+        assert datacolname in self.__dict__.keys()
         
         xyi_indx = np.array(xyi_indx)
         
         # select data column and pixels to update
-        dat = self.get(dname)
+        dat = self.get(datacolname)
         dtype = type(dat.flatten()[0])
         pxindx = np.searchsorted(self.xyi, xyi_indx)
         
@@ -353,7 +354,7 @@ class Pixelmap:
         else:    # nd array of arbitrary size
             dat[pxindx,:] = newvals.astype(dtype)
             
-        setattr(self, dname, dat)
+        setattr(self, datacolname, dat)
         
         
         
@@ -397,22 +398,22 @@ class Pixelmap:
         pid = phase.phase_id
         
         # update columns
-        for dname in self.__dict__.keys():
-            if dname in ['grid', 'xyi', 'xi', 'yi', 'phases', 'h5name', 'grains', 'dsname']:
+        for datacolname in self.__dict__.keys():
+            if datacolname in ['grid', 'xyi', 'xi', 'yi', 'phases', 'h5name', 'grains', 'dsname']:
                 continue
             
             msk = self.phase_id == pid
-            array = self.get(dname)
+            array = self.get(datacolname)
             
-            if 'strain' in dname or 'stress' in dname:
+            if 'strain' in datacolname or 'stress' in datacolname:
                 new_array = np.full(array.shape, float('inf'))
-            elif dname == 'phase_id' or dname == 'grain_id':
+            elif datacolname == 'phase_id' or datacolname == 'grain_id':
                 new_array = np.full(array.shape, -1, dtype=int)
             else:
                 new_array = np.zeros_like(array)
                 
             new_array[msk] = array[msk]
-            xmap_p.add_data(new_array, dname)
+            xmap_p.add_data(new_array, datacolname)
         
         # update phases
         for p in xmap_p.phases.pnames:
@@ -833,13 +834,13 @@ class Pixelmap:
                   
             
     
-    def plot(self, dname, phase=None, dim=0, save=False, hide_cbar=False, autoscale=False, hist_tails_cut = [2,98],
+    def plot(self, datacolname, phase=None, dim=0, save=False, hide_cbar=False, autoscale=False, hist_tails_cut = [2,98],
              show_grain_boundaries=False, smooth=False, mf_size=1, out=False, **kwargs):
-        """ Plot colormap of data in column dname using pcolormesh
+        """ Plot colormap of data in column datacolname using pcolormesh
         
         Args:
         --------
-        dname (str)      : name of data array to plot)
+        datacolname (str): name of data array to plot)
         dim (int)        : for ndarray of shape (nx*ny,M), M>1, dimension M of the data array to plot
         phase (str)      : select phase to plot. If none, use the full map. required to show grain boundaries
         save (bool)      : save plot (default is False)
@@ -856,7 +857,7 @@ class Pixelmap:
         xb, yb = self.grid.xbins, self.grid.ybins
         
         # select data to plot
-        data = self.get(dname)
+        data = self.get(datacolname)
         
         if phase is not None:
             mask = self.phase_id == self.phases.get(phase).phase_id
@@ -867,10 +868,10 @@ class Pixelmap:
         # reshape
         if len(data.shape) == 1:
             data2D = data.reshape(nx,ny)
-            title = f'{dname}'
+            title = f'{datacolname}'
         else:
             data2D = data[:,dim].reshape(nx,ny)
-            title = f'{dname}_{dim}'
+            title = f'{datacolname}_{dim}'
         
         if smooth:
             data2D = ndi.median_filter(data2D, size=mf_size)
@@ -898,12 +899,12 @@ class Pixelmap:
         # colorbar
         if not hide_cbar:
             fig.suptitle(self.h5name.split('/')[-1].split('.h')[0], y=.9)
-            if 'phase_id' in dname:
+            if 'phase_id' in datacolname:
                 cbar = pl.colorbar(im, ax=ax, orientation='vertical', pad=0.08, shrink=0.7, ticks = self.phases.pids)
                 cbar.ax.set_yticklabels(self.phases.pnames)
                 cbar.ax.set_rasterized(True)
             else:
-                cbar = pl.colorbar(im, ax=ax, orientation='vertical', pad=0.08, shrink=0.7, label=dname)
+                cbar = pl.colorbar(im, ax=ax, orientation='vertical', pad=0.08, shrink=0.7, label=datacolname)
                 cbar.ax.set_rasterized(True)
                 try:
                     cbar.formatter.set_powerlimits((-1, 1)) 
@@ -912,22 +913,20 @@ class Pixelmap:
                 
         if hide_cbar:
             fig.suptitle(self.h5name.split('/')[-1].split('.h')[0], y=1.)
-        
         if save:
-            fname = self.h5name.replace('.h5', f'_{title}.svg')
-            fig.savefig(fname, format='svg') 
+            self.saveplot(fig, title)
         if out:
             return fig
             
             
             
-    def plot_voigt_tensor(self, dname, phase=None, autoscale=True, hist_tails_cut = [2,98], show_grain_boundaries=False,
+    def plot_voigt_tensor(self, datacolname, phase=None, autoscale=True, hist_tails_cut = [2,98], show_grain_boundaries=False,
                           save=False, hide_cbar=False, smooth=False, mf_size=1, out=False, **kwargs):
         """ plot all components of strain / stress tensor (voigt notation) in a single figure
         
         Args: 
         ---------
-        dname (str)     : name of data array. data in self.dname must be a Nx6 array with strain / stress components
+        datacolname (str) : name of data array. data in self.datacolname must be a Nx6 array with strain / stress components
                             in the following order: e11,e22,e33,e23,e13,e12
         phase (str)     : Add a mask to select only selected phase. If None, keep the full map. Required for show_grain_boundaries 
         autoscale (bool): automatically adjust color scale to distribution for each strain / stress component (default is True)
@@ -942,7 +941,7 @@ class Pixelmap:
         
         nx, ny = self.grid.nx, self.grid.ny 
         xb, yb = self.grid.xbins, self.grid.ybins
-        voigt_tensor = self.get(dname)
+        voigt_tensor = self.get(datacolname)
         
         if phase is not None:
             mask = self.phase_id == self.phases.get(phase).phase_id
@@ -952,10 +951,12 @@ class Pixelmap:
         fig, ax = pl.subplots(2,3, figsize=(10,7), sharex=True, sharey=True)
         ax = ax.flatten()
         
-        if any(['strain' in dname, 'eps' in dname]):
+        if any(['strain' in datacolname, 'eps' in datacolname]):
             titles = 'e11,e22,e33,e23,e13,e12'.split(',')
-        elif any(['stress' in dname, 'sigma' in  dname]):
+            main_title = 'strain_tensor_maps'
+        elif any(['stress' in datacolname, 'sigma' in  datacolname]):
             titles = 's11,s22,s33,s23,s13,s12'.split(',')
+            main_title = 'stress_tensor_maps'
         else:
             print('data name not recognized. Should contain either "strain"/"eps" or "stress"/"sigma"')
             return
@@ -991,23 +992,21 @@ class Pixelmap:
         # Adjust layout
         fig.tight_layout()
         
-        fig.suptitle('grainmap '+dname+' - '+self.dsname, y=1.0)
+        fig.suptitle(f'{main_title} – {self.dsname}', y=1.0)
 
         if save:
-            fname = self.h5name.replace('.h5', '_'+dname+'.svg')
-            fig.savefig(fname, format='svg')
-            
+            self.saveplot(fig, main_title)
         if out:
             return fig
             
         
     ## To remove: replace with function to compute distribution + summary statistics for a selected property of the map    
-    def hist_voigt_tensor(self, dname, percentile_cut=[2,98], nbins=100, save=False, out=False, **kwargs):
+    def hist_voigt_tensor(self, datacolname, percentile_cut=[2,98], nbins=100, save=False, out=False, **kwargs):
         """ plot histogram for all components of strain / stress tensor (voigt notation)
         
         Args: 
         --------
-        dname (str)    : name of data array. data in self.dname must be a Nx6 array with strain / stress components
+        datacolname (str)    : name of data array. data in self.datacolname must be a Nx6 array with strain / stress components
                          in the following order: e11, e22, e33, e23, e13, e12
         percentile_cut : percentile thresholds ([low,up]) to cut distribution and adjust histogram width Default is [2,98]
         save (bool)    : save plot (default is False)
@@ -1015,15 +1014,17 @@ class Pixelmap:
         out (bool)     : return figure as output (default is False)
         kwargs (dict)  : keyword arguments """ 
         
-        voigt_tensor = self.get(dname)
+        voigt_tensor = self.get(datacolname)
         # figures layout
         fig, ax = pl.subplots(2,3, figsize=(10,6))
         ax = ax.flatten()
         
-        if any(['strain' in dname, 'eps' in dname]):
+        if any(['strain' in datacolname, 'eps' in datacolname]):
             titles = 'e11,e22,e33,e23,e13,e12'.split(',')
-        elif any(['stress' in dname, 'sigma' in  dname]):
+            main_title = 'strain_tensor_hist'
+        elif any(['stress' in datacolname, 'sigma' in  datacolname]):
             titles = 's11,s22,s33,s23,s13,s12'.split(',')
+            main_title = 'stress_tensor_hist'
         else:
             print('data name not recognized. Should contain either "strain"/"eps" or "stress"/"sigma"')
             return
@@ -1041,19 +1042,16 @@ class Pixelmap:
             a.legend(loc='upper left', fontsize=7)
                 
         fig.tight_layout()
-        dsname = self.h5name.split('/')[-1].split('.h')[0]
-        fig.suptitle('hist '+dname+' - '+dsname, y=1.0)
-            
+        fig.suptitle(f'{main_title} – {self.dsname}', y=1.0)
         if save:
-            fname = self.h5name.replace('.h5', '_'+dname+'_hist.pdf')
-            fig.savefig(fname, format='pdf')
+            self.saveplot(fig, main_title)
         if out:
             return fig
             
     
     
     
-    def plot_ipf_orientation(self, phase, dname='U',ipfdir = [0,0,1], ellipsoid = False, show_grain_boundaries=False, 
+    def plot_ipf_orientation(self, phase, datacolname='U',ipfdir = [0,0,1], ellipsoid = False, show_grain_boundaries=False, 
                              smooth = False, mf_size=1, save=False, hide_cbar=False, out=False, **kwargs):
         
         """ Plot inverse pole figure color map of orientation. 
@@ -1061,7 +1059,7 @@ class Pixelmap:
         Args:
         --------
         phase (str)    : name of the phase to plot. must be in self.phases
-        dname (str)    : name of orientation data array. Default is 'U'. Must be a ndarray with shape (N,3)
+        datacolname (str)    : name of orientation data array. Default is 'U'. Must be a ndarray with shape (N,3)
         ipfdir (array) : direction for the ipf colorkey in the laboratory reference frame.
                          must be a 3x1 vector [x,y,z]. Default: z-vector [0,0,1]
         smooth (bool)  : apply median filter for smoothing rgb colors (each r,g,b dimension is smoothed separately)
@@ -1090,7 +1088,7 @@ class Pixelmap:
             ipf_key = cs.ipfkey
             
         # convert orientation data to color map
-        U = self.get(dname)
+        U = self.get(datacolname)
         ori = oq.Orientation.from_matrix(U, symmetry=sym)
         rgb = ipf_key.orientation2color(ori)
         m  = self.phase_id == cs.phase_id
@@ -1121,16 +1119,25 @@ class Pixelmap:
         ax1 = fig.add_axes([0.8, 0.25, 0.15, 0.15], projection='ipf',  symmetry=sym)
         ax1.plot_ipf_color_key(show_title=False)
         pl.matplotlib.rcParams.update({'font.size': 10})
-            
-        
         fig.suptitle(self.h5name.split('/')[-1].split('.h')[0], y=.9)    
     
         if save:
             ipfd_str = ''.join(map(str, ipfdir))
-            fname = self.h5name.replace('.h5', f'_{phase}_ipf_{ipfd_str}.svg')
-            fig.savefig(fname, format='svg') 
+            self.saveplot(fig, f'{phase}_ipf_{ipfd_str}')
         if out:
             return fig
+            
+
+    def saveplot(self, fig, title):
+        """ save xmap plot to default location within the dataset directory """
+        savedir = os.path.join(os.path.dirname(self.h5name), 'XMAP_PLOTS')    # sub-folder to save plots: create it if does not exist
+        subprocess.run(f'mkdir -p {savedir}'.split(' '), check=True)         
+        
+        fname = os.path.basename(self.h5name).replace('.h5', f'_{title}.svg')
+        fig.savefig('/'.join([savedir,fname]), format='svg')
+        
+        print(f'{title} saved to {savedir}')
+        
         
         
         
