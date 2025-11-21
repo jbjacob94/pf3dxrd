@@ -265,11 +265,12 @@ def dropcolumn(cf, colname):
     return c_out
 
 
-def get_colf_size(cf, out=False):
+def get_colf_size(cf, disp=True):
     """ returns memory taken by the columnfile when loaded"""
     size_MB = sum([sys.getsizeof(cf[item]) for item in cf.keys()]) / (1024**2)
-    print('Total size = ', '%.2f' %size_MB, 'MB')
-    if out:
+    if disp:
+        print('Total size = ', '%.2f' %size_MB, 'MB')
+    else:
         return size_MB
 
     
@@ -389,7 +390,7 @@ def select_tth_rings(cf, tth_calc, tth_tol, tth_max=20, is_sorted=False):
 
 
 
-def compute_tth_histogram(cf, use_tthc=True, tthmin=0, tthmax=20, tthstep = 0.001, mask=None,
+def compute_tth_histogram(cf, tthcol='tth', tthmin=0, tthmax=20, tthstep = 0.001, mask=None,
                           uself=True, doplot=False, density=False, **kwargs):
     """
     compute two-theta histogram
@@ -398,7 +399,7 @@ def compute_tth_histogram(cf, use_tthc=True, tthmin=0, tthmax=20, tthstep = 0.00
     tthmin, tth_max: two-theta range over which kde is computed
     tth_step : bin width for histogram
     mask: selection mask for data in histogram. default is None
-    usetthc (bool) : use corrected tth column (tthc) instead of tth (sharper peaks on the kde). default is True.
+    tthcol (str) : two-theta column name. some old  script stores "corrected" vs. non-corrected (friedel pair) two-theta as tthc and tth, respectively 
     uself (bool)   : use Lorentz scaling factor for intensity:  L( theta,eta ) = sin( 2*theta )*|sin( eta )| (Poulsen 2004) 
     density : use density for histogram
     kwargs: kwargs to pass for plotting
@@ -412,22 +413,19 @@ def compute_tth_histogram(cf, use_tthc=True, tthmin=0, tthmax=20, tthstep = 0.00
         m = mask
     
     # select tth col + range
-    if use_tthc:
-        msk = np.all([cf.tthc <= tthmax, cf.tthc >= tthmin, m], axis=0)
-        tth = cf.tthc[msk]
-    else:
-        msk = np.all([cf.tth <= tthmax, cf.tth >= tthmin, m], axis=0)
-        tth = cf.tth[msk]
+    tth = cf.getcolumn(tthcol)
+    msk = np.all([tth <= tthmax, tth >= tthmin, m], axis=0)
+    tth_sel = tth[msk]
     
     #Lorentz factor for intensity correction
     if uself:
         weights = cf.sum_intensity[msk] * (np.exp( cf.ds[msk]*cf.ds[msk]*0.2 ) )
-        lf = refinegrains.lf(tth, cf.eta[msk])
+        lf = refinegrains.lf(tth_sel, cf.eta[msk])
         weights *= lf
     else:
         weights = cf.sum_intensity[msk]
         
-    hist, binedges = np.histogram(tth, weights=weights, bins=np.arange(tthmin, tthmax, tthstep), density=density)
+    hist, binedges = np.histogram(tth_sel, weights=weights, bins=np.arange(tthmin, tthmax, tthstep), density=density)
     bincens = binedges[1:] - tthstep / 2
     
     if doplot:

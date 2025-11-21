@@ -57,7 +57,7 @@ class PhaseMapper:
     
     def check_peakfile(self):
         """ 
-        make sure peakfile if ok: contains (xs,ys) + (xi,yi,xyi) columns, sorted by tthc. Also add rescaled intensity (Lorentz factor)
+        make sure peakfile if ok: contains (xs,ys) + (xi,yi,xyi) columns, sorted by tth. Also add rescaled intensity (Lorentz factor)
         """
         
         cf = self.peakfile
@@ -69,11 +69,11 @@ class PhaseMapper:
             peak_mapping.add_pixel_labels(cf, self.dataset)
         
         print('sorting by two-theta...')
-        cf.sortby('tthc')
-        self.sortkey = 'tthc'
+        cf.sortby('tth')
+        self.sortkey = 'tth'
             
         print('rescaling intensity...')        
-        lf = ImageD11.refinegrains.lf(cf.tthc, cf.eta)  # lorentz factor for intensity scaling
+        lf = ImageD11.refinegrains.lf(cf.tth, cf.eta)  # lorentz factor for intensity scaling
         cf.addcolumn(cf.sum_intensity * lf, 'sumI')
        
     
@@ -192,14 +192,14 @@ class PhaseMapper:
         cs = self.phases.get(pname)
         assert hasattr(cs, 'strong_peaks'), 'No Bragg peaks found for this phase. Please run self.compute_phase_mask'
         
-        # check peakfile is sorted by tthc (required for select_tth_rings)
-        mask = utils.select_tth_rings(self.peakfile, cs.strong_peaks[0], tth_tol, tth_max, is_sorted = self.sortkey == 'tthc')
+        # check peakfile is sorted by tth (required for select_tth_rings)
+        mask = utils.select_tth_rings(self.peakfile, cs.strong_peaks[0], tth_tol, tth_max, is_sorted = self.sortkey == 'tth')
         pks_frac = np.count_nonzero(mask) / self.npks
         
         print(f'pks fraction {cs.name}: {pks_frac:.4f}')  # prop of peaks assigned to this phase
         self.peakfile.addcolumn(mask, pname)
         self.stats_phase_masks[pname] = pks_frac
-        self.sortkey = 'tthc'  # reset sortkey
+        self.sortkey = 'tth'  # reset sortkey
         
     
     def compute_mask_overlaps(self):
@@ -441,7 +441,6 @@ class PhaseMapper:
     
         
     def plot_tth_histogram(self, min_tth, max_tth, tth_step = 0.001,
-                            show_non_corrected=False,
                             show_theorytth = True,
                             mask=None):
             
@@ -458,27 +457,18 @@ class PhaseMapper:
         """ 
             
         # sort peakfile by tth
-        if self.sortkey != 'tthc':
-            self.peakfile.sortby('tthc')
-            self.sortkey = 'tthc'
+        if self.sortkey != 'tth':
+            self.peakfile.sortby('tth')
+            self.sortkey = 'tth'
             
         fig = pl.figure(figsize=(10,5))
             
-        # raw tth plot
-        if show_non_corrected:
-            h_raw, b_raw, _ = utils.compute_tth_histogram(self.peakfile, use_tthc=False,
-                                                       tthmin = min_tth, tthmax = max_tth, tth_step = tth_step,
-                                                       mask=mask, density=True)
+        # tth plot
+        h, b, _ = utils.compute_tth_histogram(self.peakfile, use_tthc=False,
+                                            tthmin = min_tth, tthmax = max_tth, tth_step = tth_step,
+                                            mask=mask, density=True)
             
-            pl.plot(b_raw, h_raw, '--', lw=.8, label='non-corrected peaks')
-            
-        # corr tth plot
-        h, b,_ = utils.compute_tth_histogram(self.peakfile, use_tthc=True,
-                                                       tthmin = min_tth, tthmax = max_tth, tth_step = tth_step,
-                                                       mask=mask, density=True)
-        
-        pl.plot(b, h, '-', lw=.8, label = 'corrected peaks')
-            
+        pl.plot(b, h, '-', lw=.8, label='tth histogram')
             
         # add theoretical Bragg peaks from stored phases
         if show_theorytth:
@@ -514,19 +504,19 @@ class PhaseMapper:
         
         
         # sort peakfile by tth
-        if self.sortkey != 'tthc':
-            self.peakfile.sortby('tthc')
-            self.sortkey = 'tthc'
+        if self.sortkey != 'tth':
+            self.peakfile.sortby('tth')
+            self.sortkey = 'tth'
          
         # limit number of peaks to plot to 1e6; Useful for large peakfiles
         p = min(1e6/self.peakfile.nrows,1)
         m = np.random.choice([True, False], self.peakfile.nrows, p = [p, 1-p])
-        m2 = np.all([self.peakfile.tthc <= max_tth, self.peakfile.tthc >= min_tth], axis=0)
+        m2 = np.all([self.peakfile.tth <= max_tth, self.peakfile.tth >= min_tth], axis=0)
         
         # plot
         fig = pl.figure(figsize=(10,5))    
         pl.xlim(min_tth, max_tth)
-        pl.plot(self.peakfile.tthc[m*m2], self.peakfile.eta[m*m2], ',', label = 'all peaks')
+        pl.plot(self.peakfile.tth[m*m2], self.peakfile.eta[m*m2], ',', label = 'all peaks')
         
         colors = pl.matplotlib.cm.tab10.colors
         
@@ -541,7 +531,7 @@ class PhaseMapper:
             elif phase_colors == 'from_phase_id':
                 pm = self.peakfile.phase_id == cs.phase_id
             
-            pl.plot(self.peakfile.tthc[m*m2*pm], self.peakfile.eta[m*m2*pm], ',', color = color)
+            pl.plot(self.peakfile.tth[m*m2*pm], self.peakfile.eta[m*m2*pm], ',', color = color)
             
             
         # add theoretical Bragg peaks from stored phases
@@ -555,3 +545,5 @@ class PhaseMapper:
         pl.ylabel('eta deg')
                 
                     
+
+    
