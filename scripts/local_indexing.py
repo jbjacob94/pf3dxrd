@@ -5,13 +5,12 @@ performs local indexing on  a series of datasets, using indexing parameters spec
 
 # general modules
 import argparse
-import os, sys, glob
+import os, sys, site, glob
 import h5py
 import pylab as pl
 import numpy as np
 import concurrent.futures, multiprocessing
 from tqdm import tqdm
-from interruptingcow import timeout
 
 # ImageD11
 import ImageD11.sinograms.dataset
@@ -21,10 +20,15 @@ import ImageD11.indexing
 import ImageD11.grain
 import ImageD11.sym_u
 
+# add user site package + custom paths to sys.path. may not be required depending on your python setup
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
+sys.path.extend([project_root, site.getusersitepackages()])
+
 
 # pf3dxrd module available at https://github.com/jbjacob94/pf_3dxrd.
 from pf3dxrd.pf3dxrd import utils, friedel_pairs, pixelmap, crystal_structure, peak_mapping
-
+from interruptingcow import timeout
+import subprocess
 
 # UPDATE OPTIONS HERE
 ######################################################################
@@ -38,9 +42,9 @@ class Options():
     nrings         = 10      # maximum number of hkl rings to search in 
     max_mult       = 12     # maximum multiplicity of hkl rings to search in
     px_kernel_size = 3      # size of peak selection around a pixel: single pixel or nxn kernel
-    sym            = ImageD11.sym_u.monoclinic_b()   # crystal symmetry (ImageD11.sym_u symmetry)
+    sym            = ImageD11.sym_u.hexagonal()   # crystal symmetry (ImageD11.sym_u symmetry)
     ncpu           = len(os.sched_getaffinity( os.getpid() )) - 1     # ncpu. by default, use all cpus available
-    chunksize      = 20                                               # size of chunks passed to ProcessPoolExecutor
+    chunksize      = 100                                               # size of chunks passed to ProcessPoolExecutor
     
     
 # END EDITABLE PART
@@ -72,9 +76,7 @@ def load_data(pksfile, xmapfile, dsfile, parfile, pname):
     # load cf  + keep only peaks from the phase we want to index
     cf = ImageD11.columnfile.columnfile(pksfile)
     cf.parameters.loadparameters(parfile)
-    cf.updateGeometry()
-    
-    friedel_pairs.update_geometry_s3dxrd(cf, ds, update_gvecs=True)
+    friedel_pairs.update_geometry_fpairs(cf, ds)
     cf.filter(cf.phase_id==pid)
     utils.get_colf_size(cf)
     
@@ -126,9 +128,10 @@ def pixel_ubi_fit( args ):
     # prepare indexer
     ###########################################################################
     gvecs = np.array( (to_index.gx[s],to_index.gy[s],to_index.gz[s])).T.copy()
+    gv = gvecs[cut]
     ImageD11.indexing.loglevel=10  # loglevel set to high value to avoid outputs from indexer
     ind = ImageD11.indexing.indexer( unitcell = unitcell,
-                                     gv = gvecs[cut],
+                                     gv = gv,
                                      wavelength=to_index.parameters.get('wavelength'),
                                      hkl_tol= hkltol1,
                                      cosine_tol = np.cos(np.radians(90-1.)),
@@ -201,16 +204,17 @@ def pixel_ubi_fit( args ):
     
     return px, best_ubi, best_score[0], best_score[1]
 
-
-
+# module_level variable
+to_index=None
 
 def doinit(parfile, cs):
     global to_index
     ImageD11.cImageD11.cimaged11_omp_set_num_threads(1)
-    to_index = ImageD11.columnfile.colfile_from_hdf( './toindex.h5' )
+    to_index = ImageD11.columnfile.colfile_from_hdf( 'to_index.h5' )
     to_index.parameters.loadparameters(parfile)
     to_index.xyi = to_index.xyi.astype(int)   # convert xyi to default int type, otherwise peaksearch takes forever
     utils.update_colf_cell(to_index, cs.cell, cs.spg, cs.lattice_type, mute=True)  
+    print(f"[INIT] Worker PID {os.getpid()}: to_index loaded, Size = {utils.get_colf_size(to_index, disp=False):.2f} MB")
 
 
     
@@ -297,7 +301,7 @@ def update_xmap(xmap, xyi_selec, results, pname, drlv2_max = 0.1, overwrite = Tr
 def main():
     
     args = parser.parse_args()
-
+    
     # load data
     #################################################################
     print('\n=============================-')
@@ -319,16 +323,16 @@ def main():
     print('\n=============================')
     print('prepare g-vectors for indexing...')
     titles =  'gx gy gz xyi sum_intensity'.split()
-    to_index = ImageD11.columnfile.colfile_from_dict( { name: cf.getcolumn(name) for name in titles } )
-    #to_index.filter(to_index.sum_intensity > 50)    # optional : filter to remove some weak peaks
+    gv_to_index = ImageD11.columnfile.colfile_from_dict( { name: cf.getcolumn(name) for name in titles } )
+    #gv_to_index.filter(to_index.sum_intensity > 50)    # optional : filter to remove some weak peaks
 
     # sort by pixel index and save
-    to_index.sortby('xyi')
-    utils.colf_to_hdf(to_index, 'toindex.h5', save_mode='full')
+    gv_to_index.sortby('xyi')
+    utils.colf_to_hdf(gv_to_index, 'to_index.h5', save_mode='full')
     
     #list of pixels to indeX
     # FULL MAP
-    xyi_selec = xmap.xyi[xmap.phase_id == cs.phase_id]
+    xyi_selec = xmap.xyi[xmap.phase_id == cs.phase_id].astype(int)
 
     # RECTANGULAR SUBSET: uncomment these lines if you want to index only a subset of the map
     #sel = np.all([np.abs(xmap.xi-1540) < 80, np.abs(xmap.yi - 580) < 80, xmap.phase_id == cs.phase_id], axis=0)
@@ -345,10 +349,13 @@ def main():
     print('\n=============================')
     print('local indexing...')
 
-    with concurrent.futures.ProcessPoolExecutor() as pool:
-        pool.max_workers=max(OPTS.ncpu-1,1)
-        pool.initializer = doinit(args.parfile, cs),
-        pool.mp_context=multiprocessing.get_context('fork')
+    ctx = multiprocessing.get_context('fork')
+    
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=max(OPTS.ncpu-1,1),
+        initializer = doinit,
+        initargs = (args.parfile, cs),
+        mp_context=ctx) as pool:
             
         for r in tqdm(pool.map( pixel_ubi_fit, argslist, chunksize=OPTS.chunksize), total=len(xyi_selec) ):
             results[r[0]] = r[1:]
@@ -356,12 +363,14 @@ def main():
     # add results to pixelmap
     update_xmap(xmap, xyi_selec, results, args.pname, drlv2_max = 0.1, overwrite = True)
 
+    subprocess.run(f'rm to_index.h5'.split(' '), check=True)  # delete tmp to_index file
+
     # make plots and save
     #################################################################   
     print('\n=============================')
     print('Make plots and save')
     for vec in [(0,0,1),(0,1,0),(1,0,0)]:
-        xmap.plot_ipf_map(args.pname, ipfdir = vec, smooth=True, mf_size=3, save=True, hide_cbar=False, out=False)
+        xmap.plot_ipf_orientation(args.pname, ipfdir = vec, smooth=True, mf_size=3, save=False, hide_cbar=False, out=False)
     
     var_to_plot = ['nindx','drlv2']
     kw = {'cmap':'viridis'}

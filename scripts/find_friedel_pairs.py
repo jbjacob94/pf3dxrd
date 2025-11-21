@@ -2,7 +2,7 @@
 Run Friedel pair search for all scans in a peakfile. Make the code parallel over each pair of scans (dty,-dty) to match
 """
 
-import os, sys, time
+import os, sys, site, time
 import argparse
 import subprocess
 import numpy as np
@@ -20,10 +20,9 @@ import ImageD11.parameters
 import ImageD11.sparseframe
 import ImageD11.blobcorrector
 
-# workaround to add pf3dxrd folder to sys.path from the batch script
+# add user site package + custom paths to sys.path. may not be required depending on your python setup
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
+sys.path.extend([project_root, site.getusersitepackages()])
 
 from pf3dxrd.pf3dxrd import utils, friedel_pairs
 
@@ -325,10 +324,10 @@ def main():
     # tth histogram for corrected vs. uncorrected peaks
     fig = pl.figure(figsize=(10,5))
     fig.add_subplot(111)
-    h,b,_ = utils.compute_tth_histogram(cf_paired, use_tthc = False, tthmin=cf.tth.min(), tthmax = cf.tth.max(), tthstep = 0.001,
+    h,b,_ = utils.compute_tth_histogram(cf, tthmin=cf.tth.min(), tthmax = cf.tth.max(), tthstep = 0.002,
                                     uself = True, doplot=False, density=True)
-    hc,bc,_ = utils.compute_tth_histogram(cf_paired, use_tthc = True, tthmin=cf.tth.min(), tthmax = cf.tth.max(), tthstep = 0.001,
-                                      uself = True, doplot=False, density=True)
+    hc,bc,_ = utils.compute_tth_histogram(cf_paired, tthmin=cf.tth.min(), tthmax = cf.tth.max(), tthstep = 0.002,
+                                    uself = True, doplot=False, density=True)
 
     pl.plot(b,h,'-', lw=.6, label='non-corrected 2-theta')
     pl.plot(bc,hc,'-',lw=.6, label='corrected 2-theta')
