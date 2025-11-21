@@ -766,7 +766,7 @@ def update_geometry_s3dxrd(cf, ds=None, update_gvecs=True):
 
         
 
-def update_geometry_fpairs(cf, add_xyz_lab=False, relocate_fpairs=True):
+def update_geometry_fpairs(cf, ds=None, add_xyz_lab=False, relocate_fpairs=True):
     """
     Update diffraction geometry for (scanning)-3DXRD data using Friedel-pairs (omega-pair) symmetry correction:
     similar to cf.updateGeometry() but uses Friedel-pairs to correct for the offset from rotation-center.
@@ -787,6 +787,7 @@ def update_geometry_fpairs(cf, add_xyz_lab=False, relocate_fpairs=True):
     Parameters
     ----------
    -  cf : ImageD11 ColumnFile 
+   -  ds : ImageD11.sinogram dataset (optional).
    -  add_xyz_lab : bool, optional. Add corrected lab-frame coordinates to cf
    -  relocate_fpairs : bool, optional. If True, performs source-origin relocation
 
@@ -816,7 +817,8 @@ def update_geometry_fpairs(cf, add_xyz_lab=False, relocate_fpairs=True):
             sc, fc = cf.xc, cf.yc
     else:
         raise Exception("columnfile file misses xc/yc or sc/fc")
-   
+
+    cf.sortby('fp_id') # sort by fp label
     comp = transform.Ctransform(pars.parameters)
     
     # compute peak coords in lab space 
@@ -855,6 +857,8 @@ def update_geometry_fpairs(cf, add_xyz_lab=False, relocate_fpairs=True):
     tantth2  = np.tan(np.radians(tth_non_corr[1::2]))
 
     xl = xyz_corr_full[::2,0]
+    if ds is not None and 'frelon' in ds.detector:
+        xl = xl/1000  # dty is given in mm with the Frelon. Divide xl to match units 
     dx = np.sign(xl) * xl * (tantth1-tantth2)/(tantth1+tantth2)
     dx = utils.recast(dx)
     
