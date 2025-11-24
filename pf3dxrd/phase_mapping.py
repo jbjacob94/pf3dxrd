@@ -1,15 +1,24 @@
 import os, sys, copy
 from tqdm import tqdm
-import concurrent.futures, multiprocessing
+import time
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing
 import numpy as np, pylab as pl
 
 import ImageD11.refinegrains, ImageD11.columnfile, ImageD11.parameters
 from pf3dxrd.pf3dxrd import utils, peak_mapping, crystal_structure, pixelmap
 
 
+# Process polyphasic scanning-3dxrd datasets. Map phases on a 2D pixel grid, finding the best match for each pixel among a pre-defined list of candidates
+# provided  as CIF files. Details in Jacob et al. (2024): 'Exploiting Friedel pairs to interpret scanning 3DXRD data from complex geological materials'
+
+
+#======================================================================
+#                      MAIN CLASS INTERFACE
+# ======================================================================
 class PhaseMapper:
     """
-    A class to perform phase mapping on a 2D pixel grid. See corresponding publication [add doi when published]
+    PhaseMapper object wrapping all required options, input and methods for phase mapping. See notebook tutorial Tuto_002_Phase_Labelling
     """
     # Init
     ##########################
@@ -34,7 +43,7 @@ class PhaseMapper:
         self.minpks = 50
         self.min_confidence = 0.1
         self.kernel_size = 1
-        self.ncpu = len(os.sched_getaffinity( os.getpid() ))
+        self.ncpu = os.cpu_count()
         self.chunksize = 500
         
         # results and stats
@@ -44,7 +53,7 @@ class PhaseMapper:
         
         
     def __str__(self):
-        return f"PhaseMapper:\n peaks to map:{self.npks}\n {self.phases}\n phase_ids:{self.phases.pids}\n {self.pixelmap.grid}\n minpks: {self.minpks}\n min_confidence: {self.min_confidence}\n kernel_size: {self.kernel_size}"     
+        return f"PhaseMapper:\n peaks to map:{self.npks:d}\n {self.phases:d}\n phase_ids:{self.phases.pids}\n {self.pixelmap.grid}\n minpks: {self.minpks:d}\n min_confidence: {self.min_confidence:.3f}\n kernel_size: {self.kernel_size:d}"     
     
     
     def get(self,prop):
@@ -62,15 +71,15 @@ class PhaseMapper:
         
         cf = self.peakfile
         
-        assert all(['xs' in cf.titles, 'ys' in cf.titles]), 'peakfile has no coordinates in sample space. Please run friedel_pairs.update_geometry_s3dxrd'
+        assert all(['xs' in cf.titles, 'ys' in cf.titles]), 'peakfile has no coordinates in sample space. Please run friedel_pairs.update_geometry_fpairs'
         
         if 'xyi' not in self.peakfile.titles:
             print('no xyi column in peakfile. Adding pixel index...')
             peak_mapping.add_pixel_labels(cf, self.dataset)
         
-        print('sorting by two-theta...')
-        cf.sortby('tth')
-        self.sortkey = 'tth'
+        #print('sorting by two-theta...')
+        #cf.sortby('tth')
+        #self.sortkey = 'tth'
             
         print('rescaling intensity...')        
         lf = ImageD11.refinegrains.lf(cf.tth, cf.eta)  # lorentz factor for intensity scaling
@@ -193,13 +202,13 @@ class PhaseMapper:
         assert hasattr(cs, 'strong_peaks'), 'No Bragg peaks found for this phase. Please run self.compute_phase_mask'
         
         # check peakfile is sorted by tth (required for select_tth_rings)
-        mask = utils.select_tth_rings(self.peakfile, cs.strong_peaks[0], tth_tol, tth_max, is_sorted = self.sortkey == 'tth')
+        mask = utils.select_tth_rings_fast(self.peakfile, cs.strong_peaks[0], tthcol='tth', tth_tol=tth_tol, tth_max=tth_max)
         pks_frac = np.count_nonzero(mask) / self.npks
         
         print(f'pks fraction {cs.name}: {pks_frac:.4f}')  # prop of peaks assigned to this phase
         self.peakfile.addcolumn(mask, pname)
         self.stats_phase_masks[pname] = pks_frac
-        self.sortkey = 'tth'  # reset sortkey
+        #self.sortkey = 'tth'  # reset sortkey
         
     
     def compute_mask_overlaps(self):
@@ -231,123 +240,88 @@ class PhaseMapper:
         self.compute_mask_overlaps()
     
     
-    def prepare_for_phase_labeling(self):
+    def get_ready_for_phase_labeling(self):
         """ 
-        make peakfile ready for phase mapping:
-        - check phase masks have been computed
+        check mapper is ready for phase labeling and do some initialization
+        CHECKS:
+        - phases have been added
+        - phase masks have been computed
+
+        INITIALIZATION:
         - initialize phase_id column
-        - sort by xyi and convert peakfile.xyi to int (faster index search)
+        - sort peakfile by xyi and convert peakfile.xyi to int (faster index search)
         - create list of unique xyi indexes to search through
         """
-        # check phases masks are here
-        assert all([t in self.peakfile.titles for t in self.phases.pnames]), 'some phase masks are missing'
-        
-        self.peakfile.addcolumn(np.full(self.npks, -1), 'phase_id')
-        
-        # prepare xyi array
-        self.peakfile.xyi = self.peakfile.xyi.astype(int)
-        if self.sortkey != 'xyi':
+        cf = self.peakfile
+        phases = self.phases
+
+        # CHECKS
+        print('preliminary check...')
+        if len(phases.pnames) == 0:
+            raise ValueError("No phases in PhaseMapper.")
+        missing = [p for p in phases.pnames if p not in cf.titles]
+        if missing:
+            raise ValueError(f"Some phase masks are missing from peakfile: {missing}")
+
+        # INITS
+        if self.sortkey is None or self.sortkey != 'xyi':
+            print('sorting peakfile by xyi...')
             self.peakfile.sortby('xyi')
             self.sortkey = 'xyi'
-        
+        self.peakfile.xyi = self.peakfile.xyi.astype(int)  # convert to int type for faster search with np.searchsorted
+        self.peakfile.addcolumn(np.full(self.npks, -1), 'phase_id')
         self.xyi_uniq = np.unique(self.peakfile.xyi)
-        
         np.seterr(divide = 'ignore', invalid = 'ignore')
+
+        _init_worker(self.peakfile, self.phases, self.kernel_size, self.minpks, self.min_confidence)
         
         print('Ready for phase labeling!')
 
-        
+    
     def best_phase_match(self, px):
-        """ 
-        Find the best-matching phase on pixel px, among the list of phases in self.phases.
-        The best-matching phase is the one gathering the highest total cumulated intensity over pixel px
-        based on pre-computed boolean masks. Also returns confidence criteria to evaluate how good the match is.
-        Better description of the method and definition of confidence criteria in the associated publication.
-        
-        Args:
-        --------
-        px : pixel index (xyi)
-        
-        Returns:
-        --------
-        phase_id     : integer value corresponding to the index of the best phase in self.phases.pids. -1 if no phase assigned
-        completeness : Proportion of total intensity (between 0 and 1) matched by the best phase on pixel px. 0 if no match found
-        uniqueness   : Proportion of intensity (between 0 and 1) uniquely matched by the best phase (ie. no match found with any other
-                       phase for this subset). 0 if no match found
-        confidence   : normalized confidence index. product of completeness x uniqueness normalized to the number of phases.
-        pksinds      : list of peak indexes corresponding to the phase assigned on pixel px. needed to update phase_id column in peakfile
-        """
-        
-        # preliminary checks + initialization
-        ##########################################
-        
-        # check peakfile has been sorted 
-        assert all([self.sortkey == 'xyi', 'phase_id' in self.peakfile.titles]), 'peakfile is not ready. Run prepare_for_phase_labeling'
-        assert len(self.phases.pnames) > 0, 'no phases to match in self.phases'
-        assert all([t in self.peakfile.titles for t in self.phases.pnames]), 'some phase masks are missing'
-        
-        default_output = -1, 0, 0, 0, []  # default output returned if no best match can be found
-        # some aliases
-        cf = self.peakfile
-        pnames = self.phases.pnames
-        pids = self.phases.pids
-        n = len(pnames)
-        
-        # peak selection for pixel px. 
-        ##########################################
-        s = peak_mapping.pks_from_px(cf.xyi, px, kernel_size=self.kernel_size)    # peak selection for phase matching
-        s_px = peak_mapping.pks_from_px(cf.xyi, px, kernel_size=1)                # peak selection for central px
-        
-        if len(s) == 0:
-            return default_output
-        
-        # minpks filter: if not enough peaks associated with at least one phase, return default output
-        npk = np.array([np.count_nonzero(cf.getcolumn(p)[s]) for p in pnames])
-        if max(npk) < self.minpks:
-            return default_output
-        
-        # Find best match + compute confidence criteria
-        ##################################
-        # cumulated intensity for each phase ki
-        sum_I_ki = np.array([sum(cf.getcolumn(p)[s] * cf.sumI[s]) for p in pnames])   
-        # cumulated intensity of non-overlapping peaks for each phase ki
-        sum_I_ki_no_overlap = np.array([sum(cf.getcolumn(p)[s] * np.invert(cf.overlap[s]) * cf.sumI[s] ) for p in pnames])  
-        # total cumulated intensity over pixel px
-        sum_I_px = sum(cf.sumI[s])  
-        sum_I_px_assigned = sum(cf.sumI[s] * cf.assigned[s])    
+        """Sequential version — same as parallel worker."""
+        return _best_phase_match_worker(px)  
 
-        # completeness and uniqueness for each phase
-        completeness = sum_I_ki / sum_I_px
-        uniqueness   = sum_I_ki_no_overlap / sum_I_ki
-        
-        # nan filter: return default output if all phases yield 'nan' for completeness
-        if np.all(np.isnan(completeness)):
-            return default_output
-    
-        # best match
-        best_i = np.nanargmax(completeness)    # index of best-matching phase
-        pid = pids[best_i]                    # phase_id for best-matching phase
-    
-        u_best = uniqueness[best_i]
-        c_best = completeness[best_i]
-        
-        if n == 1:
-            conf_ind_best = c_best * u_best
+
+    # Parallelization 
+    # ----------------------------
+    def _parallel_label_phase(self, ncpu=None, chunksize=None):
+        if ncpu is None:
+            ncpu = max(self.ncpu - 1, 1)
+        if chunksize is None:
+            chunksize = self.chunksize
+
+        ctx = multiprocessing.get_context("fork")
+
+        with ProcessPoolExecutor(
+            max_workers=ncpu,
+            mp_context=ctx,
+            initializer=_init_worker,
+            initargs=(
+                self.peakfile,
+                self.phases,
+                self.kernel_size,
+                self.minpks,
+                self.min_confidence
+            ),
+        ) as pool:
+            for px, res in tqdm(
+                pool.map(_func_wrapper, self.xyi_uniq.astype(int), chunksize=chunksize),
+                total=len(self.xyi_uniq),
+                desc="Mapping phases (parallel, fork)"
+            ):
+                self.res[px] = res
+
+    def label_phase(self, parallelize=True, ncpu=None, chunksize=None):
+        """Main entry point."""
+        if parallelize:
+            self._parallel_label_phase(ncpu, chunksize)
         else:
-            conf_ind_best = 1/(n-1) * ( n * c_best -1) * u_best
-        
-        # min confidence filter: return default output if confidence is too low
-        if conf_ind_best < self.min_confidence:  
-            return default_output
-    
-
-        # find pksinds
-        pks = cf.getcolumn(pnames[pids.index(pid)])[s_px]   # bool array to select only peaks from the indexed phase over pixel px
-        pksinds = s_px[pks.astype(bool)]                        # pks index of selected peaks 
-        
-        return pid, c_best, u_best, conf_ind_best, pksinds
-        
-    
+            _init_worker(self.peakfile, self.phases, self.kernel_size, self.minpks, self.min_confidence)  # needed to define _GLOBALS vars
+            for px in tqdm(self.xyi_uniq, desc="Mapping phases (sequential)"):
+                self.res[px] = self.best_phase_match(px)
+    # ----------------------------
+ 
     
     def results_to_xmap(self):
         """ extract results in self.res dict and add them to pixelmap"""
@@ -456,10 +430,6 @@ class PhaseMapper:
         mask (bool)        : custom boolean mask to select a subset of peaks in peakfile. must be the same length as columns in peakfile 
         """ 
             
-        # sort peakfile by tth
-        if self.sortkey != 'tth':
-            self.peakfile.sortby('tth')
-            self.sortkey = 'tth'
             
         fig = pl.figure(figsize=(10,5))
             
@@ -544,6 +514,109 @@ class PhaseMapper:
         pl.xlabel('2-theta deg')
         pl.ylabel('eta deg')
                 
-                    
 
+        
+# MULTIPROCESSING BACKEND
+# --- Global variables for worker processes ---
+_GLOBALS = {}
+
+def _init_worker(peakfile, phases, kernel_size, minpks, min_confidence):
+    """Executed once per process to load shared data into globals."""
+    global _GLOBALS
+    _GLOBALS["peakfile"] = peakfile
+    _GLOBALS["phases"] = phases
+    _GLOBALS["kernel_size"] = kernel_size
+    _GLOBALS["minpks"] = minpks
+    _GLOBALS["min_confidence"] = min_confidence
+
+
+def _best_phase_match_worker(px):
+    """
+    Find the best-matching phase on pixel px, among a pre-defined list.
+    The best-matching phase is the one gathering the highest total cumulated intensity over pixel px
+    based on pre-computed boolean masks. Also returns confidence criteria to evaluate how good the match is.
+    See details in Jacob et al. 2024.
+        
+    Args:
+    --------
+    px : pixel index (xyi)
+        
+    Returns:
+    --------
+    list : [phase_id, completeness, uniqueness, confidence_score, peaks_index]
     
+    phase_id     : Integer label for the best phase, as in phases.pids. default = -1
+    completeness : Fraction of total intensity matched by the best phase on pixel px. default = 0
+    uniqueness   : Fraction of intensity uniquely matched by the best phase (ie. no match found with any other
+                    phase for this subset). default = 0
+    confidence   : normalized confidence index. product of completeness x uniqueness normalized to the number of phases.
+    peaks_index  : array of peak indexes corresponding to the phase assigned on pixel px. needed to update phase_id column in peakfile
+    """
+    t0 = time.perf_counter()
+    cf = _GLOBALS["peakfile"]
+    phases = _GLOBALS["phases"]
+    kernel_size = _GLOBALS["kernel_size"]
+    minpks = _GLOBALS["minpks"]
+    min_confidence = _GLOBALS["min_confidence"]
+
+    # Default output for px if no best match can be found
+    default_output = -1, 0, 0, 0, []
+    # aliases
+    pnames = phases.pnames
+    pids = phases.pids
+    n = len(pnames)
+    
+    # --- Peak selection ---
+    s = peak_mapping.pks_from_px(cf.xyi, px, kernel_size=kernel_size)
+    s_px = peak_mapping.pks_from_px(cf.xyi, px, kernel_size=1)
+    
+    if len(s) == 0:
+        return default_output
+
+    # --- Filter by minpks ---
+    npk = np.array([np.count_nonzero(cf.getcolumn(p)[s]) for p in pnames])
+    if max(npk) < minpks:
+        return default_output
+
+    # --- Compute intensities ---
+    sum_I_ki = np.array([np.sum(cf.getcolumn(p)[s] * cf.sumI[s]) for p in pnames])
+    sum_I_ki_no_overlap = np.array([
+        np.sum(cf.getcolumn(p)[s] * np.invert(cf.overlap[s]) * cf.sumI[s]) for p in pnames
+    ])
+    sum_I_px = np.sum(cf.sumI[s])
+
+    completeness = sum_I_ki / sum_I_px
+    uniqueness = sum_I_ki_no_overlap / sum_I_ki
+    
+    # --- Handle NaNs ---
+    if np.all(np.isnan(completeness)):
+        return default_output
+
+    # --- Find best phase ---
+    best_i = np.nanargmax(completeness)
+    pid = pids[best_i]
+    c_best = completeness[best_i]
+    u_best = uniqueness[best_i]
+    
+    # --- Confidence index ---
+    if n == 1:
+        conf_ind_best = c_best * u_best
+    else:
+        conf_ind_best = (1 / (n - 1)) * (n * c_best - 1) * u_best
+
+    if conf_ind_best < min_confidence:
+        return default_output
+
+    # --- Collect peak indices ---
+    pks = cf.getcolumn(pnames[pids.index(pid)])[s_px]
+    pksinds = s_px[pks.astype(bool)]
+    
+    return pid, c_best, u_best, conf_ind_best, pksinds
+
+
+
+
+
+def _func_wrapper(px):
+    """ small wrapper to return px and output """
+    return px, _best_phase_match_worker(px)
