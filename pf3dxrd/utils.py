@@ -1,5 +1,6 @@
 import os, sys, h5py, tqdm
 import numpy as np, pylab as pl, math as m
+import gc
 
 import fast_histogram
 import skimage.transform
@@ -285,7 +286,8 @@ def select_subset(cf, rowinds=None, cols=None):
              by default, keep all rows
     cols    : list. naes of columns to keep. By default, keep all columns
     """
-    
+
+    pars = cf.parameters
     if cols is None:
         cols = cf.titles
      
@@ -303,6 +305,11 @@ def select_subset(cf, rowinds=None, cols=None):
     assert all([c in cf.titles for c in cols]), 'column names not recognized'
     
     cf_sub = columnfile.colfile_from_dict({t:cf.getcolumn(t)[rowinds] for t in cols})
+    cf_sub.setparameters(pars)
+
+    # Run garbage collection
+    gc.collect()  
+    
     return cf_sub    
 
 
@@ -346,6 +353,7 @@ def recast(ary):
 def select_tth_rings(cf, tth_calc, tth_tol, tth_max=20, is_sorted=False):
     """ select all peaks within tth_tol distance from a list of hkl rings. useful to select a specific phase from computed hkl rings positions.
     If corrected tth (tthc) column is present, will try to use these instead of tth
+    NOTE: new version select_tth_rings_fast avoids sorting full columnfile by tth. saves lot of time for large datasets
     
     Args:
     ----------
@@ -385,6 +393,56 @@ def select_tth_rings(cf, tth_calc, tth_tol, tth_max=20, is_sorted=False):
     # transform indices to a bool array of len cf.nrows
     mhkl = np.zeros(cf.nrows, dtype=bool)
     mhkl[inds] = True
+
+    return mhkl
+
+
+def select_tth_rings_fast(cf, tth_calc, tthcol='tth', tth_tol=0.02, tth_max=20):
+    """ select all peaks within tth_tol distance from a list of hkl rings. useful to select a specific phase from computed hkl rings positions.
+    
+    
+    Args:
+    ----------
+    cf: columnfile
+    tthcol : two-theta column name. default is 'tth'
+    tth_calc: array of calculated tth position for hkl rings
+    tth_tol: tolerance in tth to select peaks around hkl rings
+    tth_max: max tth cutoff
+    is_sorted: if cf is already sorted on tth, can be set to True to avoid sorting it again
+    
+    Returns:
+    ----------
+    mhkl : peak selection as a Boolean mask
+    """
+    
+    # select tth col (old code uses 'tthc' for corrected two-theta, deprecated)
+    assert tthcol in cf.titles, 'tth column name not recognized'
+    tth = cf.getcolumn(tthcol).copy()
+
+    # work on ordered tth array: define forward and reverse mapping relative to columnfile order
+    order = np.argsort(tth)
+    inv_order = np.empty_like(order)
+    inv_order[order] = np.arange(len(order))
+    tth_sorted = tth[order]
+    
+    # initialize indices
+    inds = []
+    tth_max = min(tth_max, max(tth))
+    # scan each tth ring and select peaks
+    
+    for hkl in tth_calc:
+        if hkl >= tth_max:
+            break
+        imin, imax = np.searchsorted(tth_sorted, hkl - tth_tol), np.searchsorted( tth_sorted, hkl + tth_tol)
+        inds.extend(np.r_[imin:imax])
+    inds = np.asarray(inds)
+
+    # transform indices to a bool array of len cf.nrows
+    mhkl_ordered = np.zeros(cf.nrows, dtype=bool)
+    mhkl_ordered[inds] = True
+
+    # reorder mask to match with columnfile ordering
+    mhkl = mhkl_ordered[inv_order]
 
     return mhkl
 
