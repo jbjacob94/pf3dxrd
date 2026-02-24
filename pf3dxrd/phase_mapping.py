@@ -30,7 +30,7 @@ class PhaseMapper:
         self.pixelmap = xmap
         self.npks = cf.nrows
         self.wl = self.peakfile.parameters.get('wavelength')
-        self.sortkey = None
+        self.sortkey = cf.sortedby
         self.check_peakfile()
         
         # phase structures
@@ -43,7 +43,7 @@ class PhaseMapper:
         self.minpks = 50
         self.min_confidence = 0.1
         self.kernel_size = 1
-        self.ncpu = os.cpu_count()
+        self.ncpu = len(os.sched_getaffinity(os.getpid())) - 1
         self.chunksize = 500
         
         # results and stats
@@ -51,9 +51,29 @@ class PhaseMapper:
         self.stats_phase_masks = {}       # peak fraction in each phase masks, including non-assigned peaks and proportion of overlaps)
         self.stats_labeled_peaks = {}     # peak fraction for each phase after phase mapping
         
-        
     def __str__(self):
-        return f"PhaseMapper:\n peaks to map:{self.npks:d}\n {self.phases:d}\n phase_ids:{self.phases.pids}\n {self.pixelmap.grid}\n minpks: {self.minpks:d}\n min_confidence: {self.min_confidence:.3f}\n kernel_size: {self.kernel_size:d}"     
+        # Phase names (list of strings)
+        if hasattr(self.phases, "pnames") and self.phases.pnames:
+            phase_names = ", ".join(self.phases.pnames)
+            n_phases = len(self.phases.pnames)
+        else:
+            phase_names = "None"
+            n_phases = 0
+        # Phase IDs (handle list / dict / scalar safely)
+        pids = getattr(self.phases, "pids", None)
+
+        return (
+            "PhaseMapper\n"
+            "-----------\n"
+            f"Peaks to map      : {self.npks}\n"
+            f"Number of phases : {n_phases:d}\n"
+            f"Phase names      : [{phase_names}]\n"
+            f"Phase IDs        : {pids}\n"
+            f"Pixel grid       : {self.pixelmap.grid}\n"
+            f"minpks           : {self.minpks}\n"
+            f"min_confidence   : {self.min_confidence:.3f}\n"
+            f"kernel_size      : {self.kernel_size}\n"
+        )
     
     
     def get(self,prop):
@@ -66,7 +86,7 @@ class PhaseMapper:
     
     def check_peakfile(self):
         """ 
-        make sure peakfile if ok: contains (xs,ys) + (xi,yi,xyi) columns, sorted by tth. Also add rescaled intensity (Lorentz factor)
+        make sure peakfile if ok: contains (xs,ys) + (xi,yi,xyi) columns. Also add rescaled intensity (Lorentz factor)
         """
         
         cf = self.peakfile
@@ -80,10 +100,10 @@ class PhaseMapper:
         #print('sorting by two-theta...')
         #cf.sortby('tth')
         #self.sortkey = 'tth'
-            
-        print('rescaling intensity...')        
-        lf = ImageD11.refinegrains.lf(cf.tth, cf.eta)  # lorentz factor for intensity scaling
-        cf.addcolumn(cf.sum_intensity * lf, 'sumI')
+        if 'norm_intensity' not in cf.titles:
+            print('rescaling intensity...')  
+            lf = ImageD11.refinegrains.lf(cf.tth, cf.eta)  # lorentz factor for intensity scaling
+            cf.addcolumn(cf.sum_intensity * lf, 'norm_intensity')
        
     
         
@@ -97,7 +117,7 @@ class PhaseMapper:
            
         
         def __str__(self):
-            return f"phases: {self.pnames}"
+            return f"phases: {self.pname}"
         
         
         def get(self,attr):
@@ -202,13 +222,14 @@ class PhaseMapper:
         assert hasattr(cs, 'strong_peaks'), 'No Bragg peaks found for this phase. Please run self.compute_phase_mask'
         
         # check peakfile is sorted by tth (required for select_tth_rings)
-        mask = utils.select_tth_rings_fast(self.peakfile, cs.strong_peaks[0], tthcol='tth', tth_tol=tth_tol, tth_max=tth_max)
+        #mask = utils.select_tth_rings_fast(self.peakfile, cs.strong_peaks[0], tthcol='tth', tth_tol=tth_tol, tth_max=tth_max)
+        mask = utils.select_tth_rings(self.peakfile, cs.strong_peaks[0], tth_tol, tth_max)
         pks_frac = np.count_nonzero(mask) / self.npks
         
         print(f'pks fraction {cs.name}: {pks_frac:.4f}')  # prop of peaks assigned to this phase
         self.peakfile.addcolumn(mask, pname)
         self.stats_phase_masks[pname] = pks_frac
-        #self.sortkey = 'tth'  # reset sortkey
+        self.sortkey = 'tth'  # reset sortkey
         
     
     def compute_mask_overlaps(self):
@@ -264,7 +285,7 @@ class PhaseMapper:
             raise ValueError(f"Some phase masks are missing from peakfile: {missing}")
 
         # INITS
-        if self.sortkey is None or self.sortkey != 'xyi':
+        if cf.sortedby != 'xyi':
             print('sorting peakfile by xyi...')
             self.peakfile.sortby('xyi')
             self.sortkey = 'xyi'
@@ -287,7 +308,7 @@ class PhaseMapper:
     # ----------------------------
     def _parallel_label_phase(self, ncpu=None, chunksize=None):
         if ncpu is None:
-            ncpu = max(self.ncpu - 1, 1)
+            ncpu = self.ncpu
         if chunksize is None:
             chunksize = self.chunksize
 
@@ -337,10 +358,10 @@ class PhaseMapper:
         # update xmap with results
         for i,col in enumerate(['phase_id','completeness', 'uniqueness', 'phase_label_confidence']):
             dat = np.array([self.res[px][i] for px in self.xyi_uniq])
-            xmap.update_pixels(self.xyi_uniq, col, dat)
+            xmap.update_pixels(col, dat, self.xyi_uniq)
             
         npks = np.array([len(self.res[px][4]) for px in self.xyi_uniq])
-        xmap.update_pixels(self.xyi_uniq, 'Npks', npks)
+        xmap.update_pixels('Npks', npks, self.xyi_uniq)
         
         # loop through results, update xmap and phase label in peakfile
         self.peakfile.phase_id = np.full(self.peakfile.nrows, -1)
@@ -368,10 +389,10 @@ class PhaseMapper:
         print('====================')
         print('fraction of total intensity in masks \n----------')
     
-        sumItot = np.sum(self.peakfile.sumI)
+        sumItot = np.sum(self.peakfile.norm_intensity)
         for t in titles:
             mask = self.peakfile.getcolumn(t)
-            Ints_frac = np.sum(self.peakfile.sumI[mask]) / sumItot
+            Ints_frac = np.sum(self.peakfile.norm_intensity[mask]) / sumItot
             print(f'{t}: {Ints_frac:.4f}')  # prop of peaks assigned to this phase
             stats_dict[t].append(Ints_frac)
                            
@@ -398,7 +419,7 @@ class PhaseMapper:
         print('====================')
         print('fraction of total intensity \n----------')
     
-        sumItot = np.sum(self.peakfile.sumI)
+        sumItot = np.sum(self.peakfile.norm_intensity)
         for t in titles:
             if t == 'assigned':
                 m = self.peakfile.phase_id != -1
@@ -406,7 +427,7 @@ class PhaseMapper:
                 pid = self.phases.pids[self.phases.pnames.index(t)]
                 m = self.peakfile.phase_id == pid
                 
-            Ints_frac = np.sum(self.peakfile.sumI[m]) / sumItot
+            Ints_frac = np.sum(self.peakfile.norm_intensity[m]) / sumItot
             print(f'{t}: {Ints_frac:.4f}')  # prop of peaks assigned to this phase
             stats_dict[t].append(Ints_frac)
                            
@@ -579,11 +600,11 @@ def _best_phase_match_worker(px):
         return default_output
 
     # --- Compute intensities ---
-    sum_I_ki = np.array([np.sum(cf.getcolumn(p)[s] * cf.sumI[s]) for p in pnames])
+    sum_I_ki = np.array([np.sum(cf.getcolumn(p)[s] * cf.norm_intensity[s]) for p in pnames])
     sum_I_ki_no_overlap = np.array([
-        np.sum(cf.getcolumn(p)[s] * np.invert(cf.overlap[s]) * cf.sumI[s]) for p in pnames
+        np.sum(cf.getcolumn(p)[s] * np.invert(cf.overlap[s]) * cf.norm_intensity[s]) for p in pnames
     ])
-    sum_I_px = np.sum(cf.sumI[s])
+    sum_I_px = np.sum(cf.norm_intensity[s])
 
     completeness = sum_I_ki / sum_I_px
     uniqueness = sum_I_ki_no_overlap / sum_I_ki
@@ -612,8 +633,6 @@ def _best_phase_match_worker(px):
     pksinds = s_px[pks.astype(bool)]
     
     return pid, c_best, u_best, conf_ind_best, pksinds
-
-
 
 
 
