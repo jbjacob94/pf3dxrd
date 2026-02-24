@@ -2,10 +2,17 @@ import os, sys, copy
 import numpy as np
 import pylab as pl
 from tqdm import tqdm
+from numba import njit
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
+
+from scipy.spatial.transform import Rotation as R
 
 import ImageD11.columnfile, ImageD11.grain, ImageD11.refinegrains, ImageD11.cImageD11
 import xfab
-from orix import quaternion as oq
+from orix import quaternion as oq, vector as ovec
+import orix.vector as ovec, orix.quaternion as oq, orix.plot as opl
+from orix.crystal_map import Phase
 
 from pf3dxrd.pf3dxrd import utils, crystal_structure, pixelmap
 
@@ -60,10 +67,9 @@ def add_pixel_labels(cf, ds):
     cf.addcolumn( yi, 'yi')
     xyi = np.array(xi + yi * 10000)  
     cf.addcolumn( xyi.astype(int), 'xyi')   # do not use np.uint32, for some reasons it is 100x slower when running np.searchsorted
-    cf.sortby('xyi')
     
     
-def sorted_xyi_inds(cf, is_sorted=False):
+def sorted_xyi_inds(cf):
     """ 
     Runs np.searchsorted on xyi column in cf. Make sure cf is sorted by xyi before. 
     
@@ -75,7 +81,6 @@ def sorted_xyi_inds(cf, is_sorted=False):
     Args: 
     --------
     cf : imageD11 columnfile, with xyi column
-    is_sorted (bool) : indicates whether cf has been sorted by xyi indices (required). Default is False
     
     Returns:
     --------
@@ -85,7 +90,8 @@ def sorted_xyi_inds(cf, is_sorted=False):
     
     assert 'xyi' in cf.titles, 'xyi has not been computed. Run add_pixel_labels first'
     
-    if not is_sorted:
+    if not cf.sortedby == 'xyi':
+        print('sorting peakfile by xyi...')
         cf.sortby('xyi')
     
     xyi_uniq = np.unique(cf.xyi).tolist()
@@ -195,14 +201,13 @@ def pks_from_px(sorted_xyi_array, xy0, kernel_size=1, debug=0):
 # Peaks to grain / grain to peaks mapping
 ###########################################################################
     
-def pks_from_grain(cf, g, is_cf_sorted = False, check_px_inds=False):
+def pks_from_grain(cf, g, check_px_inds=False):
     """find peak indices corresponding to a grain g in a peakfile cf
     
     Args:
     ---------
     cf : peakfile sorted by xyi index
     g  : ImageD11 grain. must contain a "xyi_indx" attribute providing the list of xyi indices over which the grain mask extends
-    is_cf_sorted : bool flag indicating whether cf has been sorted by xyi (required for np.searchsorted)
     check_px_inds: check whether all xyi indices in g.xyi_indx are present in cf (slow). Default is False
 
 
@@ -212,7 +217,7 @@ def pks_from_grain(cf, g, is_cf_sorted = False, check_px_inds=False):
     
     assert 'xyi_indx' in dir(g)
     
-    if not is_cf_sorted:
+    if not cf.sortedby == 'xyi':
         cf.sortby('xyi')
     
     return pks_inds_fast(cf.xyi, g.xyi_indx, check_list = check_px_inds)
@@ -240,123 +245,187 @@ def map_grains_to_cf(glist, cf, overwrite=False):
         assert hasattr(g, 'xyi_indx'), 'grain missing pixel mask (xyi_indx)'
 
         gid = g.__getattribute__('gid')
-        
-        pksindx = pks_from_grain(cf, g, is_cf_sorted = True, check_px_inds=False)  # get peaks from grain g
-        
+        pksindx = pks_from_grain(cf, g, check_px_inds=False)  # get peaks from grain g
         # map grain to cf and pks to grain
         cf.grain_id[pksindx] = gid
         g.pksindx = pksindx
                 
     print('completed')  
+
+
+# cluster g-vectors by hkl
+###########################################################################
+def select_by_hkl_family(ubi, gvecs, hkl_tol = 0.1, phase=None, hkl=(0,0,1), symmetrise=False):
+    """
+    select g-vectors by closest hkl integer indices. return mask for g-vector selection
+    parameters:
+    ------------
+    ubi (3x3 array)    : lattice vectors matrix
+    gvecs ((n,3) array : reciprocal lattice vectors (gx,gy,gz)
+    hkl_tol (float)    : hkl tolerance for g-vector filtering
+    hkl (3-tuple)      : (h,k,l) integer indices to select
+    phase (orix.Phase) : orix phase obj (optional). required if symmetrise option is chosen
+    symmetrise (bool)  : if True, return all g-vecs corresponding to the symmetry-equivalent {hkl} family
+
+    returns:
+    hklmask (bool array) : selection mask for corresponding g-vectors
+    """
+    # filter gvecs
+    gvecs, _, _ = refine_loop(ubi, gvecs, np.full(gvecs.shape, True), hkl_tol)
+    hkls = np.round( ubi.dot( gvecs.T ) ).T
+    
+    # find all hkls in familly
+    if phase is None:
+        phase = Phase(space_group=1)
+    if symmetrise:
+        miller = ovec.Miller(hkl=hkl, phase=phase).symmetrise(unique=True)
+    else:
+        miller = ovec.Miller(hkl=hkl, phase=phase)
+    hklgroup = np.round(miller.hkl,2).astype(int)
+    print(hkls.shape)
+    # mask
+    hklmask = np.full(len(hkls),False, dtype=bool)
+    hkls = hkls.astype(int)
+    for m in hklgroup:
+        mhkl = np.all([hkls[:,0] == m[0], hkls[:,1] == m[1], hkls[:,2] == m[2]], axis=0)
+        hklmask += mhkl
+    return hklmask
+
+    
+    
+def cluster_by_hkl(gvecs, intensities, ubi):
+    """  Cluster g-vectors by their integer hkl indices and merge redundant peaks. 
+    The merged peak’s g-vector is computed as a weighted average of all contributing g-vectors (weights = intensities)
+
+    Returns
+    -------
+    gv_mean : (M, 3) ndarray of weighted-mean g-vector for each unique (h,k,l) index.
+    hklu : (3, M) ndarray of unique integer (h,k,l) triplets corresponding to each merged peak.
+    Isum : (M,) ndarray of summed intensity for each unique hkl.
+    """
+    
+    # Compute integer hkl indices for each g-vector
+    hkls = np.round(ubi @ gvecs.T)
+    hklindx = (10000 * hkls[0] + 100 * hkls[1] + hkls[2]).astype(np.int64)
+
+    #  Sort by hkl index to bring identical hkl values together
+    order = np.argsort(hklindx)
+    hklindx_sorted = hklindx[order]
+    gvecs_sorted = gvecs[order]
+    intensities_sorted = intensities[order]
+
+    # Identify group boundaries for each unique hkl
+    diffs = np.diff(hklindx_sorted, prepend=hklindx_sorted[0] - 1)
+    group_starts = np.nonzero(diffs)[0]
+    group_ends = np.r_[group_starts[1:], len(hklindx_sorted)]
+
+    #  Weighted averaging within each group (peak merging)
+    gv_mean, Isum = _reduce_groups(group_starts, group_ends, gvecs_sorted, intensities_sorted)
+    hklu = hkls[:, order[group_starts]]
+    
+    return gv_mean, hklu, Isum
+
+
+@njit
+def _reduce_groups(group_starts, group_ends, gvecs, intensities):
+    n_groups = len(group_starts)
+    gv_mean = np.zeros((n_groups, 3))
+    Isum = np.zeros(n_groups)
+    for i in range(n_groups):
+        start, end = group_starts[i], group_ends[i]
+        ints = intensities[start:end]
+        wsum = np.sum(ints)
+        gv_sum = np.zeros(3)
+        for j in range(start, end):
+            gv_sum += gvecs[j] * intensities[j]
+        gv_mean[i] = gv_sum / wsum
+        Isum[i] = wsum
+    return gv_mean, Isum
+
+
+def cluster_by_hkl_(gvecs, intensities, ubi):
+    """  Cluster g-vectors by their integer hkl indices and merge redundant peaks. 
+    The merged peak’s g-vector is computed as a weighted average of all contributing g-vectors (weights = intensities)
+
+    Returns
+    -------
+    gv_mean : (M, 3) ndarray of weighted-mean g-vector for each unique (h,k,l) index.
+    hklu : (3, M) ndarray of unique integer (h,k,l) triplets corresponding to each merged peak.
+    Isum : (M,) ndarray of summed intensity for each unique hkl.
+    """
+    
+    # Compute integer hkl indices for each g-vector
+    hkls = np.round(ubi @ gvecs.T)
+    hklindx = (10000 * hkls[0] + 100 * hkls[1] + hkls[2]).astype(np.int64)
+
+    #  Sort by hkl index to bring identical hkl values together
+    order = np.argsort(hklindx)
+    hklindx_sorted = hklindx[order]
+    gvecs_sorted = gvecs[order]
+    intensities_sorted = intensities[order]
+
+    # Identify group boundaries for each unique hkl
+    diffs = np.diff(hklindx_sorted, prepend=hklindx_sorted[0] - 1)
+    group_starts = np.nonzero(diffs)[0]
+    group_ends = np.r_[group_starts[1:], len(hklindx_sorted)]
+
+    #  Weighted averaging within each group (peak merging)
+    gv_mean, Isum, Imean = _reduce_groups_(group_starts, group_ends, gvecs_sorted, intensities_sorted)
+    hklu = hkls[:, order[group_starts]]
+    return gv_mean, hklu, Isum, Imean
+
+
+@njit
+def _reduce_groups_(group_starts, group_ends, gvecs, intensities):
+    n_groups = len(group_starts)
+    gv_mean = np.zeros((n_groups, 3))
+    Isum = np.zeros(n_groups)
+    Imean = np.zeros(n_groups)
+    for i in range(n_groups):
+        start, end = group_starts[i], group_ends[i]
+        ints = intensities[start:end]
+        wsum = np.sum(ints)
+        wmean = np.mean(ints)
+        gv_sum = np.zeros(3)
+        for j in range(start, end):
+            gv_sum += gvecs[j] * intensities[j]
+        gv_mean[i] = gv_sum / wsum
+        Isum[i] = wsum
+        Imean[i] = wmean
+    return gv_mean, Isum, Imean
  
 
                
-# grain refinement: refine lattice vectors matrix using the whole set of peaks assigned to he grain
+# grain /pixel ubi refinement: refine lattice vectors matrix using the whole set of peaks assigned to the grain/pixel
 ###########################################################################
-               
     
-def refine_grains(glist, cf, hkl_tol, nmedian= np.inf, sym = None, return_stats=True):
-    """ Refine peaks_to_grain assignement and fit unit cell matrix for all grains in glist
-    
-    - dodgy peaks are removed (drlv*drlv > hkl_tol)
-    - fit outliers are removed abs(median err) > nmedian
-    - peaks to grain labeling (g.pksindx) updated
-    
-    Peaks selection using g.pksindx. If no attribute "pksindx" is found for the grain, run function "map_grain_to_cf" in Pixelmap
-    
-    Args:
-    -------
-    glist : list of ImageD11 grains to be refined
-    cf : ImageD11 columnfile sorted by xyi indices
-    hkl_tol : hkl tolerance for peaks
-    nmedian : threshold to remove outliers ( abs(median err) > nmedian ). Default is inf: no outliers removed
-    sym : crystal symmetry (orix.quaternion.symmetry.Symmetry object). used to evaluate misorientation between old and new orientation. 
-    return_stats: returns list of rotation (angle between old and new crystal orientation) + fraction of peaks retained. Default is True
-    """
-    
-    stats = {'pkprop':[], 'angle deviation':[], 'mean drlv2':[]}
-    prop_indx, ang_dev = [], []
-    
-    for g in tqdm(glist):
-        assert 'pksindx' in dir(g), 'grain has not attribute "pksindx"'
-    
-        gv = np.transpose([cf.gx[g.pksindx], cf.gy[g.pksindx], cf.gz[g.pksindx]]).copy() 
-        N0 = len(gv)  # initial peak number
-        ubi0, u0 = g.ubi.copy(), g.U.copy() # keep a copy of old ubi + u mats
-        
-        # refine grain ubis
-        for i in range(2):
-            # compute hkl and drlv for each peak
-            hkl = np.dot(g.ubi, gv.T)
-            hkli = np.round( hkl )
-            # Error on these:
-            drlv = hkli - hkl
-            drlv2 = (drlv*drlv).sum(axis=0)
-    
-            # filter out dodgy peaks
-            ret = drlv2 < hkl_tol*hkl_tol
-            g.pksindx = g.pksindx[ret]
-    
-            #remove outliers
-            update_mask(g, cf, cf.parameters, nmedian)
-    
-            #fit orientation with clean peaks only
-            gv = np.transpose([cf.gx[g.pksindx], cf.gy[g.pksindx], cf.gz[g.pksindx]])
-            ImageD11.cImageD11.score_and_refine(g.ubi, gv, tol=1)  # set large hkltol to take all peaks in g.pksindx
-            g.set_ubi(g.ubi)
+@njit
+def refine_loop(ubi, gvecs, gvmask, hkl_tol):
+    """Fast numeric part of the refinement."""
+    hkl = ubi @ gvecs.T
+    hkli = np.round(hkl)
+    drlv = hkli - hkl
+    drlv2 = (drlv * drlv).sum(axis=0)
+    ret = drlv2 < hkl_tol * hkl_tol
+    gvecs = gvecs[ret]
+    gvmask = gvmask[ret]
+    return gvecs, gvmask, drlv2
 
-        # compute rotation angle between former and new ubi + prop of peaks retained
-        o1 = oq.Orientation.from_matrix(u0, symmetry =sym)  # old orientation
-        o2 = oq.Orientation.from_matrix( g.U, symmetry = sym) # new orientation 
-        
-        stats['angle deviation'].append( o2.angle_with(o1, degrees=True)[0] )
-        stats['pkprop'].append( len(g.pksindx) / N0)
-        stats['mean drlv2'].append(drlv2.mean())
-        
-    if return_stats:
-        return stats
-    
 
-def refine_ubi(gvecs, ubi, hkl_tol):
+def refine_px_ubi(cf, px, UBI, U, hkl_tol=0.1, sym = None, kernel_size=1):
     """ 
-    small function to refine lattice vector matrix (ubi) from a set of g-vectors, excluding dodgy peaks (drlv*drlv > hkl_tol)
-    same as refine_px_ubi but without pixel selection for g-vectors
-    """   
-    ubi0 = copy.deepcopy(ubi) # keep a copy of old ubi
-    N0 = len(gvecs)  # initial peak number
-    
-    for i in range(2):
-        # compute hkl and drlv2 for each peak
-        hkl = np.dot(ubi0, gvecs.T)
-        hkli = np.round( hkl )
-        # Error on these:
-        drlv = hkli - hkl
-        drlv2 = (drlv*drlv).sum(axis=0)
-    
-        # filter out dodgy peaks
-        ret = drlv2 < hkl_tol*hkl_tol
-        gvecs = gvecs[ret]
-
-        #fit orientation with clean peaks only
-        ImageD11.cImageD11.score_and_refine(ubi, gvecs, tol=1)  # set large hkltol to take all peaks in selection
-        
-    return ubi, gvecs
-        
-
-
-def refine_px_ubi(cf, xmap, px, UBI_col = 'UBI',U_col = 'U', hkl_tol=0.1, sym = None, kernel_size=1):
-    """ 
-    refine pixel ubi (lattice vector matrix) excluding dodgy g-vectors (drlv*drlv > hkl_tol)
+    refine lattice vector matrix (ubi) excluding dodgy g-vectors (drlv*drlv > hkl_tol) for a selected pixel.
+    g-vectors are weighted by intensity and merged by unique hkl for better orientation fitting.
+    returns error (mean drlv squared) and completeness (proportion of indexed intensity) metrics 
     
     Args:
     -------
     cf      : ImageD11 columnfile sorted by xyi indices
-    xmap    : Pixelmap object contianing indexing results (UBI column)
-    px      : pixel index (xyi index)
-    hkl_tol : hkl tolerance for peaks
-    sym     : crystal symmetry (orix.quaternion.symmetry.Symmetry object). used to evaluate misorientation between old and new orientation. 
+    px      : pixel index in xmap (xyi index)
+    hkl_tol : hkl tolerance for g-vector filtering
+    sym     : crystal symmetry (orix.quaternion.symmetry.Symmetry object). oiptional, used to evaluate rotation between old and new orientation. 
     kernel_size : n-by-n kernel size around central pixel for peak selection. default is 1. 
-    UBI_col/U_col : (str) UBI/U column names, containing the lattice vector matrices / rotation matrices for each pixel
+    UBI/U : (3x3 mat) UBI/U lattice vector matrices / rotation matrices for selected pixel
     
     Returns:
     --------
@@ -364,75 +433,161 @@ def refine_px_ubi(cf, xmap, px, UBI_col = 'UBI',U_col = 'U', hkl_tol=0.1, sym = 
     gvecs   : g-vectors retained
     gvmask  : boolean mask over cf corresponding to retained g-vectors
     hkli    : integer hkl indices of retained g-vectors
-    stats   : statistics: mean drlv2, proprtion of g-vecs retained, angle shift (degree) between old and new lattice vector matrix
-    
-    
+    stats   : statistics: mean drlv2, n indexed, completeness, angle shift (degree) between old and new orientation
     """
     # select peaks from cf
-    s = pks_from_px(cf.xyi.astype(int), px, kernel_size=kernel_size)
-    gvecs = np.array([cf.gx[s], cf.gy[s], cf.gz[s]]).T
-    
-    # select ubi from xmap
-    try:
-        pxindx = np.argwhere(xmap.xyi == px)[0][0]
-    except IndexError:
-        print('pixel index not found in xmap')
-        return
-    
-    ubi = xmap.get(UBI_col)[pxindx]
-    U0 = xmap.get(U_col)[pxindx]
-    ubi0 = copy.deepcopy(ubi) # keep a copy of old ubi
-    N0 = len(gvecs)  # initial peak number
+    gvmask = pks_from_px(cf.xyi, px, kernel_size=kernel_size)
+    gvecs = np.array([cf.gx[gvmask], cf.gy[gvmask], cf.gz[gvmask]]).T
+    if 'norm_intensity' in cf.titles:
+        intensities = cf.norm_intensity
+    else:
+        intensities = cf.sum_intensity
+        
+    U0 = copy.deepcopy(U)
+    Itot_0 = np.sum(intensities[gvmask])   # total intensity over the selection. for completeness estimation
+
+    default_stats = {'mean drlv2':np.nan, 'nindx':0, 'completeness':0, 'angle dev (degree)': np.nan}
         
     # check ubi is correct
     try:
-        xfab.tools.ubi_to_u(ubi)
+        xfab.tools.ubi_to_u(UBI)
     except ValueError as e:
         print(f'px {px}: {e}')
-        stats = {'mean drlv2':np.nan,'pkprop':np.nan, 'angle dev (degree)': np.nan}
-        return ubi, [], s, [], stats
+        return UBI, U, [], gvmask, [], default_stats
         
     # refine ubis
-    for i in range(2):
-        # compute hkl and drlv2 for each peak
-        hkl = np.dot(ubi, gvecs.T)
-        hkli = np.round( hkl )
-        # Error on these:
-        drlv = hkli - hkl
-        drlv2 = (drlv*drlv).sum(axis=0)
-    
-        # filter out dodgy peaks
-        ret = drlv2 < hkl_tol*hkl_tol
-        s = s[ret]
+    for i in range(1):
+        # filter g-vectors and update mask
+        gvecs, gvmask, _ = refine_loop(UBI, gvecs, gvmask, hkl_tol)
+        if len(gvmask) == 0:
+            return  UBI, U, [], gvmask, [], default_stats   
+        ints = intensities[gvmask]
 
-        #fit orientation with clean peaks only
-        gvecs = np.transpose([cf.gx[s], cf.gy[s], cf.gz[s]])
-        ImageD11.cImageD11.score_and_refine(ubi, gvecs, tol=1)  # set large hkltol to take all peaks in selection
-    
+        # merge g-vectors by unique hkl
+        gvecs_merged, hkl_uniqs, Isum = cluster_by_hkl(gvecs, ints, UBI)
+        # update ubi with merged g-vectors
+        nindx, drlv2 = ImageD11.cImageD11.score_and_refine(UBI, np.ascontiguousarray(gvecs_merged), tol=1)  # set large hkltol to take all peaks in selection
         
     # recompute integer hkl index for retained peak
-    hkli = np.round(np.dot(ubi, gvecs.T))
-    pkprop = len(gvecs)/N0
+    hkli = np.round(np.dot(UBI, gvecs.T))
+    completeness = Isum.sum() / Itot_0
     
     # compute rotation angle between former and new ubi + proportion of peaks retained
-    o = oq.Orientation.from_matrix(U0, symmetry =sym)  # old orientation
-    o2 = oq.Orientation.from_matrix( xfab.tools.ubi_to_u(ubi), symmetry = sym) # new orientation 
-    ang_dev =  o2.angle_with(o, degrees=True)[0]
+    try:
+        U = xfab.tools.ubi_to_u(UBI)
+    except ValueError as e:
+        print(f'px {px}: {e}')
+        return UBI, U, [], gvmask, [], default_stats
+
+    if sym is not None:
+        o = oq.Orientation.from_matrix(U0, symmetry =sym)  # old orientation
+        o2 = oq.Orientation.from_matrix(U, symmetry = sym) # new orientation 
+        ang_dev =  o2.angle_with(o, degrees=True)[0]
+    else:
+        ang_dev = np.nan
     
-    gvmask = s   # alias
-    stats = {'mean drlv2':drlv2.mean(),'pkprop':pkprop, 'angle dev (degree)': ang_dev}
+    stats = {'mean drlv2':drlv2, 'nindx':nindx, 'completeness':completeness, 'angle dev (degree)': ang_dev}
     
-    return ubi, gvecs, gvmask, hkli, stats
+    return UBI, U, gvecs, gvmask, hkli, stats
+
+
+def refine_px_ubi_fast(gvecs, intensities, UBI, hkl_tol=0.1):
+    """ 
+    same as refine_px_ubi but takes directly g vectors as input and computes orientation shift directly from matrices (without considering crystal symmetry)
+    aimed to be used in local_indexing script
+    """
+    default_output = np.zeros((3,3)), np.nan, np.nan, np.nan, np.nan
+    Itot_0 = np.sum(intensities)
+    # check ubi is correct
+    try:
+        U0 = xfab.tools.ubi_to_u(UBI)
+    except ValueError as e:
+        return default_output  
+        
+    # refine ubis: there were initially two iterations, but does not seem to make a difference. 
+    for i in range(1):   
+        #  first refinements using all g-vectors
+        gvecs, ints, _ = refine_loop(UBI, gvecs, intensities, hkl_tol)
+        if len(gvecs) == 0:
+            return default_output
+
+        # merge g-vectors by unique hkl and re-do refinement: better orientation fit
+        gvecs_merged, hkl_uniqs, Isum = cluster_by_hkl(gvecs, ints, UBI)
+        nindx, drlv2 = ImageD11.cImageD11.score_and_refine(UBI, np.ascontiguousarray(gvecs_merged), tol=1)  # set large hkltol to take all peaks in selection
+
+    # compute orientation shift between former and new ubi + completeness score
+    completeness = np.sum(Isum) / Itot_0  
     
+    try:
+        U = xfab.tools.ubi_to_u(UBI)
+    except ValueError as e:
+        return default_output
+
+    rot = R.from_matrix(U @ U0.T)
+    angle_shift = rot.magnitude() * 180/np.pi
+    
+    return UBI, nindx, drlv2, completeness, angle_shift
+
 
     
+def refine_grains(glist, cf, hkl_tol, intensities, nmedian= np.inf, sym = None, return_stats=True):
+    """ 
+    Refine peaks_to_grain assignement and fit unit cell matrix for all grains in glist.
+    - dodgy peaks are removed (drlv*drlv > hkltol and abs(median err) > nmedian
+    - peaks to grain labeling (g.pksindx) updated
+    - g-vectors merged by unique hkl and weighted by intensity before fitting
+    """
+    
+    stats = {'completeness':[], 'nindx':[], 'angle deviation':[], 'mean drlv2':[]}
+    completeness, ang_dev = [], []
+    if intensities is None:
+        intensities = cf.sum_intensity
+    
+    for g in tqdm(glist):
+        assert 'pksindx' in dir(g), 'grain has not attribute "pksindx"'
+
+        gvecs = np.transpose([cf.gx[g.pksindx], cf.gy[g.pksindx], cf.gz[g.pksindx]]).copy()
+        ints = intensities[g.pksindx]
+        N0 = len(gvecs)  # initial peak number
+        Itot_0 = np.sum(ints)
+        ubi0, u0 = g.ubi.copy(), g.U.copy() # keep a copy of old ubi + u mats
+
+        # refine ubis
+        #############
+        for _ in range(1):
+            # compute hkl and drlv2 for each peak and remove outliers
+            gvecs, g.pksindx, _ = refine_loop(g.ubi, gvecs, g.pksindx, hkl_tol)
+            update_mask(g, cf, cf.parameters, nmedian)
+            gvecs_merged, hkl_uniqs, Isum = cluster_by_hkl(gvecs, ints, g.ubi)
+
+            #fit orientation with clean peaks only
+            nindx,drlv2 = ImageD11.cImageD11.score_and_refine(g.ubi, gvecs_merged, tol=1)  # set large hkltol to take all peaks in selection
+            g.set_ubi(g.ubi)
+        
+        g.TotalIntensity = Isum.sum()
+        completeness = g.TotalIntensity / Itot_0
+
+        # compute rotation angle between former and new ubi + prop of peaks retained
+        o1 = oq.Orientation.from_matrix(u0, symmetry =sym)  # old orientation
+        o2 = oq.Orientation.from_matrix( g.U, symmetry = sym) # new orientation 
+        
+        stats['angle deviation'].append( o2.angle_with(o1, degrees=True)[0] )
+        stats['completeness'].append(completeness)
+        stats['mean drlv2'].append(drlv2)
+        stats['nindx'].append(nindx)
+        
+    if return_stats:
+        return stats
+    
+    
+
 def update_mask( g, cf, pars, nmedian ):
     """
     Remove nmedian*median_error outliers from grains assigned peaks. Modified from s3dxrd.peak_mapper 
     (https://github.com/FABLE-3DXRD/scanning-xray-diffraction)
     """
     # obs data for this grain
-    tthobs = cf.tthc[g.pksindx]
+    tthobs = cf.tth[g.pksindx]
     etaobs = cf.eta[g.pksindx]
     omegaobs = cf.omega[g.pksindx]
     gobs = np.array( (cf.gx[g.pksindx], cf.gy[g.pksindx], cf.gz[g.pksindx]) )
