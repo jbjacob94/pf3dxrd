@@ -87,8 +87,9 @@ def check_y_symmetry(cf, ds, saveplot=False, fname_plot=None):
         form_y_pairs(cf, ds, disp=False)
     
     # order cf by dty scans to quickly find peaks from each scan
-    print('sorting peakfile by dty scans...')
-    cf.sortby('dty')
+    if cf.sortedby != 'dty':
+        print('sorting peakfile by dty scans...')
+        cf.sortby('dty')
     inds = np.searchsorted(cf.dty, ds.ybinedges)
     
     # compute sum of intensity and Npeaks for each scan
@@ -109,11 +110,14 @@ def check_y_symmetry(cf, ds, saveplot=False, fname_plot=None):
     
     f = pl.figure(figsize=(8,8), layout='constrained')
     for i, (dat,lab,leg) in enumerate(zip(ydata,ylabel,legend)):
-        f.add_subplot(2,2,i+1)
-        pl.plot(hi_side, dat, '.', label=leg)
-        pl.xlabel('|dty|')
-        pl.ylabel(lab)
+        ax = f.add_subplot(2,2,i+1)
+        ax.plot(hi_side, dat, '.', label=leg)
+        ax.set_xlabel('|dty|')
+        ax.set_ylabel(lab)
+        if 'ratio' in leg:
+            ax.set_ylim(0.8,1.2)
         pl.legend()
+        
     
     f.suptitle('dty alignment – '+str(ds.dsname))
     
@@ -123,7 +127,7 @@ def check_y_symmetry(cf, ds, saveplot=False, fname_plot=None):
         f.savefig(fname_plot, format='png')
         
         
-def select_y_pair(cf, ds, pair_id, is_sorted=False):
+def select_y_pair(cf, ds, pair_id):
     """ select peaks from two symmetric scans and return them as two separate columnfiles.
     
     Args : 
@@ -131,14 +135,13 @@ def select_y_pair(cf, ds, pair_id, is_sorted=False):
     cf     : ImageD11 columnfile with complete data (all dty scans)
     ds     : ImageD11.sinograms.dataset.Dataset object
     pair_id: index of ypair to select in ds.ypairs
-    is_sorted: indicate whether peakfile has already been sorted by dty, so it does not need to be done again.
     
     Outputs:
     ---------
     c1, c2 : symmetric columnfiles containing respectively peaks from the hi-side (+dty) and the lo-side (-dty) of the selected ypair
     """
     # order cf by dty scans to quickly find peaks from each scan
-    if not is_sorted:
+    if not cf.sortedby == 'dty':
         print('sorting peakfile by dty scans...')
         cf.sortby('dty')
     inds = np.searchsorted(cf.dty, ds.ybinedges)
@@ -403,11 +406,6 @@ def label_friedel_pairs(c1, c2, dist_max=1., dist_step=0.1, mtth = 5, mI=1/5, ve
     
     # INITIALIZATION
     ###############################################################################################
-    # sort c1 and c2 on spot3d_id at the begining. No sure whether it is useful, but does not harm
-    if 'spot3d_id' in c1.titles:
-        c1.sortby('spot3d_id')
-        c2.sortby('spot3d_id')
-    
     # create new friedel pair label + fp_dist for c1 and c2,and initialize all values to -1 (non paired)
     c1.addcolumn(np.full(c1.nrows, -1, dtype=int), 'fp_id')
     c2.addcolumn(np.full(c2.nrows, -1, dtype=int), 'fp_id')
@@ -539,7 +537,7 @@ def label_friedel_pairs(c1, c2, dist_max=1., dist_step=0.1, mtth = 5, mI=1/5, ve
 def process_ypair(args):
     """ group processing of y-pairs in a single function, which takes a list of arguments args as input. Useful for parallelization"""
     cf, ds, pair_id, dist_max, dist_step, mtth, mI, doplot = args
-    c1, c2 = select_y_pair(cf, ds, pair_id, is_sorted=True)
+    c1, c2 = select_y_pair(cf, ds, pair_id)
     c_merged = label_friedel_pairs(c1, c2, dist_max, dist_step, mtth, mI, verbose=False, doplot=doplot)
     c_merged.sortby('fp_id')
     return c_merged
@@ -569,7 +567,7 @@ def find_all_pairs(cf, ds, dist_max=.1, dist_step=0.01, mtth = 5, mI = 1/5):
     Note : Initially, this function was also merging outputs in a single peakfile. 
     The function has been splitted and thsi part of the process is now done with merge_outputs (below)
     
-    Note 2: This function runs on a signle cpu (no parallelization), which can be slow for large peakfiles. 
+    Note 2: This function runs on a single cpu (no parallelization), which can be slow for large peakfiles. 
     Use script find_friedel_pairs.py (with parallelization) for faster processing. 
     
     See also: merge_outputs, label_friedel_pairs
@@ -817,8 +815,10 @@ def update_geometry_fpairs(cf, ds=None, add_xyz_lab=False, relocate_fpairs=True)
             sc, fc = cf.xc, cf.yc
     else:
         raise Exception("columnfile file misses xc/yc or sc/fc")
-
-    cf.sortby('fp_id') # sort by fp label
+    
+    if not cf.sortedby == 'fp_id':
+        print('sorting peakfile by friedel pair index...')
+        cf.sortby('fp_id') # sort by fp label
     comp = transform.Ctransform(pars.parameters)
     
     # compute peak coords in lab space 
@@ -902,7 +902,8 @@ def split_fpairs(cf):
     c1, c2: splitted columnfiles, each containing one element of each fridel pair.
     c1.nrows = c2.nrows = 1/2 * cf.nrows
     """
-    cf.sortby('fp_id')  # soirt by friedel pair index
+    if not cf.sortedby == 'dty':
+        cf.sortby('fp_id')  # soirt by friedel pair index
     cols = cf.titles
     c1 = columnfile.colfile_from_dict({t:cf.getcolumn(t)[::2] for t in cols})
     c2 = columnfile.colfile_from_dict({t:cf.getcolumn(t)[1::2] for t in cols})
@@ -919,7 +920,8 @@ def exclude_singles(cf):
     assert 'fp_id' in cf.titles, 'Friedel pairs have not been identified. Run friedel pair search before'
     
     cf_filtered = cf.copy()
-    cf_filtered.sortby('fp_id')
+    if not cf.sortedby == 'dty':
+        cf_filtered.sortby('fp_id')
     
     # find fp_id values occurring twice
     uniqs, indx, cnt = np.unique(cf.fp_id, return_index=True, return_counts=True)
