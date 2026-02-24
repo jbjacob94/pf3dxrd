@@ -1,6 +1,9 @@
 import os, sys, h5py, tqdm
-import numpy as np, pylab as pl, math as m
+import numpy as np
+import matplotlib.pyplot as pl
+import math as m
 import gc
+import copy
 
 import fast_histogram
 import skimage.transform
@@ -28,32 +31,13 @@ def colf_to_hdf( colfile, hdffile, save_mode='minimal', name=None, compression='
         Minimal mode saves only necessary information that cannot be computed with updateGeometry() (default),
         while full mode saves all columns 
         """  
-        # LIST OF COLUMNS TO SAVE AS INTEGERS. UPDATED FROM IMAGED11
-        INTS = [
-        "Number_of_pixels",
-        "IMax_f",
-        "IMax_s",
-        "Min_f",
-        "Max_f",
-        "Min_s",
-        "Max_s",
-        "spot3d_id",
-        "fp_id",
-        "xyi",
-        "xi",
-        "yi",
-        "phase_id",
-        "h", "k", "l",
-        "onfirst", "onlast", "labels",
-        "labels",
-        "Grain",
-        "grainno",
-        "grain_id",
-        "IKEY",
-        "npk2d"
-        ]
-        
-        
+        # LIST OF COLUMNS TO SAVE AS INTEGERS / FLOATS. UPDATED FROM IMAGED11
+        INTS   = columnfile.INTS + ['xyi']              # store as np.int32 : max ~ 2.14e9
+        LONGINTS = ['fp_id']                            # store as np.int64 : max ~ 9.22e18
+        SHORTINTS = ['h','k','l','xi','yi','phase_id', 'grain_id']  # store as np.int16 : max = 32768
+        FLOATS = columnfile.FLOATS + ['xs', 'ys', 'fp_dist', 'r_dist', 'norm_intensity'] # store as np.float32
+    
+    
         if isinstance(colfile, columnfile.columnfile):
             c = colfile
         else:
@@ -83,9 +67,14 @@ def colf_to_hdf( colfile, hdffile, save_mode='minimal', name=None, compression='
         
         for t in cols:
             if t in INTS:
-                ty = np.int32
+                if t in SHORTINTS:
+                    ty = np.int16
+                elif t in LONGINTS:
+                    ty = np.int64
+                else:
+                    ty = np.int32
             else:
-                ty = np.float32
+                ty = np.float64
             # print "adding",t,ty
             dat = getattr(c, t).astype( ty )
             if t in list(g.keys()):
@@ -257,7 +246,6 @@ def merge_peakfiles(cf_list):
 def dropcolumn(cf, colname):
     """ remove column from colfile """
     assert colname in cf.titles
-    
     titles = [t for t in cf.titles if t != colname]
     c_out = columnfile.newcolumnfile(titles=titles)
     c_out.setparameters(cf.parameters)
@@ -370,11 +358,11 @@ def select_tth_rings(cf, tth_calc, tth_tol, tth_max=20, is_sorted=False):
     
     # use tth or tthc. Arrays need to be sorted on tth/tthc for indices selection
     if 'tthc' in cf.titles:
-        if not is_sorted:
+        if not is_sorted or cf.sortedby != 'tth':
             cf.sortby('tthc')
         tth = cf.tthc
     else:
-        if not is_sorted:
+        if not is_sorted or cf.sortedby != 'tth':
             cf.sortby('tth')
         tth = cf.tth
 
@@ -408,7 +396,6 @@ def select_tth_rings_fast(cf, tth_calc, tthcol='tth', tth_tol=0.02, tth_max=20):
     tth_calc: array of calculated tth position for hkl rings
     tth_tol: tolerance in tth to select peaks around hkl rings
     tth_max: max tth cutoff
-    is_sorted: if cf is already sorted on tth, can be set to True to avoid sorting it again
     
     Returns:
     ----------
