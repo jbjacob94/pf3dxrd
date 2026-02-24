@@ -1,23 +1,25 @@
 import os, sys, copy, h5py, tqdm
 import numpy as np, pylab as pl
 import subprocess
+import inspect, re
 
 from matplotlib_scalebar.scalebar import ScaleBar
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 import matplotlib.cm as cm, matplotlib.colors as mcolors
 
 import scipy.ndimage as ndi
 import skimage.transform, skimage.morphology
-
 
 import ImageD11.cImageD11
 import ImageD11.columnfile
 import ImageD11.grain
 import ImageD11.refinegrains
 import ImageD11.unitcell
+import ImageD11.sinograms.tensor_map as tensor_map
 import xfab
 
 from orix import data, io, plot as opl, quaternion as oq, vector as ovec
-from pf3dxrd.pf3dxrd import utils, crystal_structure, peak_mapping
+from pf3dxrd.pf3dxrd import utils, crystal_structure, peak_mapping, orientation
 
 """
 plot scanning 3DXRD outputs on a 2D pixelmap. 
@@ -31,7 +33,6 @@ plot scanning 3DXRD outputs on a 2D pixelmap.
 class Pixelmap:
     """ A class to store pixel information on a 2d grid """
     
-    # Init
     ##########################
     def __init__(self, xbins, ybins, h5name=None):
         # grid + pixel index
@@ -58,7 +59,50 @@ class Pixelmap:
     def get(self,attr):
         """ alias for __getattribute__"""
         return self.__getattribute__(attr).copy()
-    
+
+    def get_phase_mask(self, phase):
+        """ method to mask map by selected phase """
+        if phase not in self.phases.pnames:
+            raise ValueError('phase not in self.phases')
+        return self.phase_id == self.phases.get(phase).phase_id
+
+    def as_grid(self):
+        """
+        Reshape all flat (N, ...) ndarray attributes into grid form
+        using self.grid_shape.
+
+        Returns full copy of xmap with reshaped arrays
+        """
+        grid_shape = self.grid.shape
+        N = np.prod(grid_shape)
+
+        target = self.copy()
+
+        for name in self.titles():
+            val = self.get(name)
+            if isinstance(val, np.ndarray) and val.ndim >= 1:
+                if val.shape[0] == N:
+                    setattr(
+                        target,
+                        name,
+                        val.reshape((*grid_shape, *val.shape[1:]))
+                    )
+        return target
+
+    def to_tensor_map(self):
+        """ export xmap data columnbs to ImageD11.sinograms.tensor_map"""
+        phase_dict = self.phases.as_dict()
+        phase_dict_tmap = {cs.phase_id:cs.to_ImageD11_unitcell() for cs in phase_dict.values()}
+        
+        xmap_g = self.as_grid()
+        tmap = tensor_map.TensorMap(maps={t:xmap_g.get(t)[np.newaxis,...] for t in xmap_g.titles()},
+                                    phases = phase_dict_tmap)
+        
+        tmap.add_map('phase_ids', tmap['phase_id'])
+        
+        del xmap_g
+        return tmap
+        
     
     # subclasses
     ###########################################################################
@@ -75,7 +119,7 @@ class Pixelmap:
             
             
         def __str__(self):
-            return f"grid: size: {self.shape}, pixel size: {str(self.pixel_size)+' '+self.pixel_unit}"
+            return f"grid: size: {self.shape}, pixel size: {self.pixel_size:.2f} {self.pixel_unit}"
    
         def scalebar(self):
             """ scalebar for plotting maps"""
@@ -97,13 +141,16 @@ class Pixelmap:
             self.pnames = ['notIndexed']
             self.pids = [-1]
            
-        
         def __str__(self):
             return f"phases: {self.pnames}"
         
         
         def get(self,attr):
             return self.__getattribute__(attr)
+
+        def as_dict(self):
+            return {pname: self.get(pname) for pname in self.pnames if pname != 'notIndexed'}
+            
             
             
         def add_phase(self, pname, cs):
@@ -324,40 +371,74 @@ class Pixelmap:
         """ returns a deep copy of the pixelmap """
         pxmap_new = copy.deepcopy(self)
         return pxmap_new
-    
-    
-    def update_pixels(self, xyi_indx, datacolname, newvals, debug=0):
-        """ update data column datacolname with new values for a subset of pixel selected by xyi indices, without touching other pixels
-        
+
+
+    def update_pixels(self, datacolname, newvals, xyi_indx=None, selection_mask=None, debug=False):
+        """
+        Update a subset of pixels in a data column without touching others.
+        2 modes:
+        - selection by xyi indices (useful when working with peakfile, e.g. for indexing)
+        - by boolean mask array
+        If no selection, full array is updated. 
+
         Args:
         ---------
-        xyi_indx: list of xyi index of pixels to update
-        datacolname: name of the data column to update
-        newvals: array of new values. Must have same length as xyi_indx"""
-        
-        assert datacolname in self.__dict__.keys()
-        
-        xyi_indx = np.array(xyi_indx)
-        
-        # select data column and pixels to update
-        dat = self.get(datacolname)
-        dtype = type(dat.flatten()[0])
-        pxindx = np.searchsorted(self.xyi, xyi_indx)
-        
+        datacolname (str): data column to update
+        newvals: array of new values. Must have same length as the pixel selection
+        xyi_indx (array, int): xyi index of pixels to update
+        selection_mask (array, bool): boolean array the same length as datacolumn.
+        """
+
+        # ---- sanity checks ----
+        if datacolname not in self.titles():
+            raise KeyError(f"Data column '{datacolname}' not found")
+
+        # ---- retrieve data (make a copy to avoid side effects) ----
+        dat = np.array(self.get(datacolname), copy=True)
+        n_pix = dat.shape[0]
+
+        # ---- build pixel index array ----
+        if xyi_indx is None and selection_mask is None:
+            pxindx = np.arange(n_pix)
+
+        elif selection_mask is not None:
+            selection_mask = np.asarray(selection_mask, dtype=bool)
+            if len(selection_mask) != n_pix:
+                raise ValueError("selection_mask has incorrect length")
+            pxindx = np.flatnonzero(selection_mask)
+
+        else:
+            xyi_indx = np.asarray(xyi_indx)
+            if not np.all(np.isin(xyi_indx, self.xyi)):
+                raise ValueError("Some xyi_indx values not found in map")
+
+            # robust mapping from xyi value → pixel index
+            lookup = {v: i for i, v in enumerate(self.xyi)}
+            pxindx = np.array([lookup[v] for v in xyi_indx], dtype=int)
+
         if debug:
-            print('pxindx', pxindx.min(), pxindx.max())
-        
-        # update data
-        assert newvals.shape[1:] == dat.shape[1:]  # check array shape compatibility
-        if len(dat.shape) == 1:  # dat is simple 1d array
-            dat[pxindx] = newvals.astype(dtype)
-        else:    # nd array of arbitrary size
-            dat[pxindx,:] = newvals.astype(dtype)
-            
+            print(f"Updating {len(pxindx)} pixels "
+                  f"(min={pxindx.min()}, max={pxindx.max()})")
+
+        # ---- validate newvals shape ----
+        newvals = np.asarray(newvals)
+
+        if dat.ndim == 1:
+            if newvals.shape != (len(pxindx),):
+                raise ValueError("newvals must have shape (N,)")
+            dat[pxindx] = newvals.astype(dat.dtype)
+
+        else:
+            if newvals.shape != (len(pxindx),) + dat.shape[1:]:
+                raise ValueError(
+                    f"newvals must have shape {(len(pxindx),) + dat.shape[1:]}"
+                )
+            dat[pxindx, ...] = newvals.astype(dat.dtype)
+
+        # ---- write back ----
         setattr(self, datacolname, dat)
-        
-        
-        
+    
+            
     def update_grains_pxindx(self, mask=None, update_map=False):
         """ update grains pixel masks (pxindx / xyi_indx in grain properties), according to criterions defined in mask.
         Allows to remove bad pixels (large misorientation, low npks indexed, high drlv2, etc.) from grain masks. 
@@ -365,8 +446,8 @@ class Pixelmap:
         Args:
         --------
         mask: bool array of same shape as data columns (grid.nx*grid.ny,) to filter bad pixels
-        update_map: if True, grain_id in pixelmap will also be updated. 
-        MAKE A COPY OF PIXELMAP FIRST, OR INITIAL GRAIN INDEXING WILL BE LOST Default is False"""
+        update_map: if True, grain_id in pixelmap will also be updated. Default is False
+        """
         
         if mask is None:
             mask = np.full(self.xyi.shape, True)
@@ -384,7 +465,7 @@ class Pixelmap:
         
         
     def filter_by_phase(self, pname):
-        """ Returns a new pixelmap containing only the selected phase. Makes a deep copy of the pixelmap and reinitialize
+        """ Returns a new map containing only the selected phase. Makes a deep copy of the pixelmap obj and reinitialize
         all pixels not corresponding to the selected phase. Also update h5name in new pixelmap, to avoid overwriting the former file
         
         pname : phase name. must be in self.phases
@@ -402,7 +483,7 @@ class Pixelmap:
             if datacolname in ['grid', 'xyi', 'xi', 'yi', 'phases', 'h5name', 'grains', 'dsname']:
                 continue
             
-            msk = self.phase_id == pid
+            msk = self.get_phase_mask(pname)
             array = self.get(datacolname)
             
             if 'strain' in datacolname or 'stress' in datacolname:
@@ -431,11 +512,9 @@ class Pixelmap:
     
     
     
-    def add_grains_from_map(self, pname, overwrite=False):
+    def add_grains_from_map(self, pname, Ucol='U', overwrite=False):
         """ 
         Use grain masks defined in grain_id column to compute grains and add them to self.grains.
-        Assumes that local indexing has been completed (ie, the map contains a UBI column with fitted lattice vectors on each pixel)
-        and grain_id column is not empty.
         
         For each grain mask (subset of pixel with the same grain_id value), a "median" unit cell matrix is computed as follows:
         - unit cell (a,b,c,alpha,beta,gamma) is taken as the median unit cells of each pixel on the grain mask - > B_med matrix
@@ -447,11 +526,10 @@ class Pixelmap:
         pname: name of phase to select. must be in self.phases
         overwrite: re-initialize grains dict. Default is False
         
-        NB: "median" unit cell matrices obtained for each grain at this stage are maybe not extremely robust:
-        Each pixel is weighted the same way, regardless of the number of peaks indexed for each pixel.
-        This is quite dodgy, so you might want to refine ubis after this step. For this, map the peaks from the original peakfile
-        used for indexing to the grains in xmap, and then refine ubis using these peaks. These two steps are done using the methods 
-        "map_pks_to_grains" and "refine_ubis" """
+        NB: averaged unit cell matrices obtained for each grain at this stage need to be refined:
+        Each pixel is weighted the same way, regardless of the number of peaks indexed for each pixel, and the "averaging" procedure may be a bit dodgy
+        To refine grain lattice vector matrices (UBI), you need the peakfile used for indexing: first map peaks to grains ("self.map_pks_to_grains") and 
+        then use all assigned peaks to fit the new unit cell matrix ("self.refine_grain_ubis") """
         
         assert 'UBI' in self.__dict__.keys()
               
@@ -461,7 +539,7 @@ class Pixelmap:
         sym = cs.orix_phase.point_group.laue
         
         # masks for pixel selection
-        pm = np.any([self.phase_id == pid, self.phase_id == -1], axis=0) # phase mask. 
+        pm = np.any([self.get_phase_mask(pname), self.get_phase_mask('notIndexed')], axis=0) # phase mask. 
         isUBI = np.asarray( [np.trace(ubi) != -3 for ubi in self.UBI] )   # mask for pixels that have a consistent unit cell matrix assigned
       
         # list of unique grain_id for the selected phase
@@ -481,7 +559,7 @@ class Pixelmap:
             gm = self.grain_id==i
             
             # compute mean grain orientation (use quaternion space for this) and return it as a matrix U_g
-            ori_gi_mask = oq.Orientation.from_matrix(self.U[pm*gm*isUBI], symmetry = sym)
+            ori_gi_mask = oq.Orientation.from_matrix(self.get(Ucol)[pm*gm*isUBI], symmetry = sym)
             ori_mean = ori_gi_mask.mean()
             ori_mean.symmetry = cs.orix_phase.point_group.laue
             ori_mean = ori_mean.map_into_symmetry_reduced_zone()
@@ -493,20 +571,22 @@ class Pixelmap:
                 B_med = ImageD11.unitcell.unitcell(uc_med).B
             except Exception as e:
                 print(f'grain_id:{i}: {e}, {uc_med}')
+                self.grain_id[gm] = -1  # reset grain_id in xmap
+                continue
                 
             # compute mean ubi and create new grain
             try:
                 UBI_g = np.linalg.inv(U_g.dot(B_med))[0]
             except np.linalg.LinAlgError as e:
                 print(f'grain_id:{i}: {e}')
-                self.grain_id[gm] = -1  # reset grain_id n xmap
+                self.grain_id[gm] = -1  # reset grain_id in xmap
                 continue
     
             try:
                 g = ImageD11.grain.grain(UBI_g)  
             except Exception as e:
                 print(f'grain_id:{i}:{e},{uc_med}')
-                self.grain_id[gm] = -1  # reset grain_id n xmap
+                self.grain_id[gm] = -1  # reset grain_id in xmap
                 continue
             
             # grain to xmap mapping
@@ -551,7 +631,6 @@ class Pixelmap:
         pname : phase name to select
         cf    : peakfile which has been used for indexing. 
         overwrite : if True, reset 'grain_id' column in cf. default if False
-        
         See also: peak_mapping.map_grains_to_cf
         """
         glist = self.grains.select_by_phase(pname)        
@@ -561,7 +640,7 @@ class Pixelmap:
     
     
     
-    def refine_ubis(self, pname, cf, hkl_tol, nmedian, sym):  
+    def refine_grain_ubis(self, pname, cf, hkl_tol, nmedian, sym):  
         """  
          Run peak_mapping.refine_grain for each grain in self.grains.glist, choosing a specific phase
          - refine peaks_to_grain assignement excluding dodgy peaks (hkl_tol threshold) and outliers (nmedian threshold)
@@ -573,7 +652,6 @@ class Pixelmap:
         pname : phase name to select
         cf    : peakfile used for indexing
         hkl_tol : tolerance to pass to score_and_refine
-        nmedian : threshold to remove outliers ( abs(median err) > nmedian ). Use np.inf to keep all peaks
         sym : crystal symmetry, used to compute angular shift between new and old orientation
         
         Output: 
@@ -582,88 +660,118 @@ class Pixelmap:
         """
         glist = self.grains.select_by_phase(pname)
         print('refining ubis...')
-        stats = peak_mapping.refine_grains(glist, cf, hkl_tol = hkl_tol, nmedian = nmedian, sym = sym, return_stats=True)
+        if 'norm_intensity' not in cf.titles:
+            lf = ImageD11.refinegrains.lf( cf.tth, cf.eta )
+            cf.addcolumn( lf * cf.sum_intensity, 'norm_intensity' )
+            
+        stats = peak_mapping.refine_grains(glist, cf, hkl_tol = hkl_tol, intensities=cf.norm_intensity, nmedian = nmedian, sym = sym, return_stats=True)
         self.grains.dict = dict(zip(self.grains.gids, self.grains.glist))
         return stats
     
     
     
-    ##WORK IN PROGRESS
-    def refine_ubis_px(self, pname, cf, hkl_tol, nmedian, sym):
-        """ Refine unit cell matrix UBI for each pixel. Work in progres..."""
+    def refine_px_ubis(self, pname, cf, sym, hkl_tol=0.1, UBI_col = 'UBI',U_col = 'U', kernel_size=1):
+        """ Refine unit cell matrix UBI for each pixel. See peak_mapping.refine_px_ubi for detail"""
+        # pixel selection
         pid = self.phases.get(pname).phase_id
-        sel = self.phase_id == pid
+        sel = self.get_phase_mask(pname)
+        pxlist = self.xyi[sel]
+        UBIs = self.get(UBI_col)[sel]
+        Us = self.get(U_col)[sel]
+
+        # initialize outputs
+        new_UBIs = np.zeros_like(UBIs)
+        new_Us = np.zeros_like(Us)
+        stats = {'mean drlv2':[], 'nindx':[], 'pkprop':[], 'angle dev (degree)': []}
         
-        # create grains from pixel ubis and add peak mapping to these grains
-        glist = [ImageD11.grain.grain(ubi) for ubi in self.UBI[sel]]
         
-        indpos = np.searchsorted( cf.xyi, np.append(self.xyi, self.xyi.max()+1) )
-        inds = [ np.arange(indpos[i], indpos[i+1]) for i in range(len(self.xyi)) ]
-        inds_sel = [ind for i,ind in enumerate(inds) if sel[i]]
-        
-        for i,g in zip(inds_sel,glist):
-            g.pksindx = i
-            g.phase = pname
-               
-        # refine ubis and update xmap.ubi data
         print('refining ubis...')
-        prop_indx, ang_dev = peak_mapping.refine_grains(glist, cf, hkl_tol = hkl_tol, nmedian = nmedian, sym = sym, return_stats=True)
+        iterator = tqdm.tqdm(zip(pxlist, UBIs, Us))
+        for i, (px, ubi, u) in enumerate(iterator):
+            res = peak_mapping.refine_px_ubi(cf, px, ubi, u, hkl_tol, sym, kernel_size)  # UBI, U, gvecs, gvmask, hkli, stats
+
+            new_UBIs[i] = res[0]
+            new_Us[i] = res[1]
+            for k,v in stats.items():
+                v.append(res[-1][k])
+
+        # update properties (ubi, U, unitcell, etc.) in xmap
+        uc    = np.array([xfab.tools.ubi_to_cell(ubi) if np.trace(ubi) > 0 else np.zeros_like(self.unitcell[0]) for ubi in new_UBIs])
+        nindx = np.array(stats['nindx'])
+        drlv2 = np.array(stats['mean drlv2'])
+        compl = np.array(stats['completeness'])
+
+        print(drlv2.shape)
+        self.update_pixels('UBI', new_UBIs, self.xyi[sel])
+        self.update_pixels('U',   new_Us, self.xyi[sel])
+        self.update_pixels('unitcell', uc, self.xyi[sel])
+        self.update_pixels('nindx', nindx, self.xyi[sel] )
+        self.update_pixels('drlv2', drlv2, self.xyi[sel] )
+        self.update_pixels('indx. completeness', compl, self.xyi[sel] )
         
-        # update grain properties (ubi, U, unitcell) in xmap
-        self.update_pixels(self.xyi[sel], 'UBI', np.array([g.ubi for g in glist]))
-        self.update_pixels(self.xyi[sel], 'U', np.array([g.U for g in glist]))
-        self.update_pixels(self.xyi[sel], 'unitcell', np.array([g.unitcell for g in glist]))
-        self.update_pixels(self.xyi[sel], 'nindx', np.array([p*n for p,n in zip(prop_indx,self.nindx[sel])]) )
-        
-        return prop_indx, ang_dev
+        return stats
     
     
-    def map_grain_boundaries(self, pname=None, Ucol='U', threshold_deg=10):
+    def calcGrains(self, pname, Ucol='U', threshold_deg=10, min_grain_size=3, update_grain_id = True):
         """
-        map grain boundaries based on a misorientation threshold between pixels. Returns grain boundary pixels as a labeled mask.
-        
-        Args:
-        ----------
-        pname : phase name (str)
-        Ucol  : name of the column containing orientation matrices. default = 'U'
-        threshold_deg : angle threshold (in degree) to identify 
-        
-        outputs:
-        -----------
-        gb_mask_<phase>  : selection mask for pixels on grain boundaries
-        gb_misorientation_<phase>: maximum misorientation angle on boundary pixels
-        
-        TO DO: use gb_mask to segment individual grains -> grain_id 
+        segment grains based on a misorientation threshold and add grain labels and grain boundaries to xmap. 
+        See pf3dxrd.orientation.segment_grains for details
+
+        Adds/update the following columns to pixelmap:
+        - grain_id: update column with new grain labels. Does not modify non-selected phases.
+        If grain_id is non empty, adds new grain labels on top of pre-existing ones: e.g. unique grain_id = -1,0,...n, -> new labels start at n+1
+        - gb_mask_<pname> : grain boundary mask for the selected phase
+        - gb_angle_<pname> : grain bundary misorientation for the selected phase (in degree)
+        - update_grain_id  : bool, update grain_id column in xmap if True. Otherwise, just computes grain boundaries
         """
-        assert pname in self.phases.pnames, 'phase name not recognized'
-        
-        # select phase 
-        xmap_p = self.filter_by_phase(pname)
-        cs = xmap_p.phases.get(pname)
-        sym = cs.orix_phase.point_group.laue
-        
-        # get pixel orientations
-        ori = oq.Orientation.from_matrix(xmap_p.get(Ucol), symmetry=sym).reshape(self.grid.nx,self.grid.ny)
-    
-        # Calculate misorientation between each pixel and its neighbor: either the right neighbor (e-w dir) or top neighbor (n-s dir)
-        mo_ns = oq.Misorientation(ori[:,:-1]*~ori[:,1:], symmetry=(sym,sym)).to_axes_angles() 
-        mo_ew = oq.Misorientation(ori[:-1,:]*~ori[1:,:], symmetry=(sym,sym)).to_axes_angles()
-    
-        # take the max between n-s and e-w misorientation + pad image to get back to original grid size
-        mo_max = np.maximum(np.degrees(mo_ew.angle)[:,:-1], np.degrees(mo_ns.angle)[:-1,:])
-        mo_max = np.pad(mo_max, ((1, 0), (1, 0)), mode='constant', constant_values=0)
-        
-        # apply a threshold to identify high-angle grain boundary pixels
-        gb_mask = np.where(mo_max > threshold_deg, 1, 0).flatten()   # pixel mask with grain boundary pixels
-        gb_angle = np.where(gb_mask, mo_max.flatten(), 0)  # misorientation angle at grain boundaries
-            
-        # grain boundary nodes: centre of grain boundary pixels
-        #gb_coords = np.column_stack(np.where(gb_mask))
-    
-        # add to xmap
+        phase_mask = self.get_phase_mask(pname)
+
+        # run segment_grains from orientation module
+        grain_id, gb_mask, gb_misorientation = orientation.segment_grains(self, pname, Ucol, threshold_deg, min_grain_size)
+        grain_id = grain_id.flatten()
+        gb_mask = gb_mask.flatten()
+        gb_misorientation = gb_misorientation.flatten()
+
+        # add grain boundary columns
         self.add_data(gb_mask,f'gb_{pname}')
-        self.add_data(gb_angle,f'gb_misorientation_{pname}')
-              
+        self.add_data(gb_misorientation,f'gb_misorientation_{pname}')
+    
+        # update grain_id column
+        if update_grain_id:
+            if self.grain_id.max() == -1:
+                grain_id = np.where(grain_id > 0, grain_id, -1)
+            else:
+                grain_id = np.where(grain_id > 0, grain_id + self.grain_id.max() + 1, -1)
+          
+            self.update_pixels('grain_id', grain_id[phase_mask], selection_mask=phase_mask)
+        
+
+
+    def calcKAM(self, pname, Ucol='U', kernel_size=3, threshold_deg=1, mode='mean', use_numba_acceleration=True):
+        """ compute local misorientation (kernel-averaged misorientation) and add results to xmap """
+        assert pname in self.phases.pnames, 'phase name not recognized'
+        phase_mask = self.get_phase_mask(pname)
+        
+        kam = orientation.local_misorientation(self, pname, Ucol, kernel_size, threshold_deg, mode, use_numba_acceleration)
+        kam = kam.flatten()
+        kam[~phase_mask] = 0
+        self.add_data(kam,f'KAM_{pname}')
+
+
+    def calcGROD(self, pname=None, pixel_orientation="U", reference_frame="sample", axis_coordinates="cartesian", degrees=True):
+        """ Computes grain reference orientation deviation (GROD) for all grains in self.grains. See orientation.compute_grod for details"""
+        if not self.grains.glist:
+            print('no grains in xmap.grains. use calcGrain and add_grains_from_map to create a grain list')
+            return
+
+        GROD = orientation.compute_GROD(self, pname, pixel_orientation, reference_frame, axis_coordinates, degrees=degrees)
+        for k,v in GROD.items():
+            if f'GROD_{k}' not in self.titles() or pname is None:
+                self.add_data(v, f'GROD_{k}')
+            else:
+                pm = self.get_phase_mask(pname)
+                self.update_pixels(f'GROD_{k}', v[pm], selection_mask=pm)
+    
         
     
     def map_grain_prop(self, prop, pname=None, debug=0):
@@ -721,6 +829,9 @@ class Pixelmap:
         # update with values from grains in graindict
         #####################################  
         for gi,g in tqdm.tqdm(zip(self.grains.gids, self.grains.glist)):
+            if g.phase != pname:
+                continue
+                
             gm = self.grain_id == gi
             #gm = np.argwhere(gid_map == gi).T[0]  # grain mask
             
@@ -734,119 +845,24 @@ class Pixelmap:
         self.add_data(newarray, prop_name)
             
             
-    def compute_GROD(self,pixel_orientation='U', reference_frame = 'sample', axis_coordinates = 'cartesian', degrees=True):
-        """
-        Computes grain reference orientation deviation (GROD) as an axis-ange misorientation between the pixel orientation and 
-        the mean grain orientation. Mean grain orientation is taken from the grain list in self.grains. 
-        
-        Gives the smallest possible misorientation modulo crystal symmetry. GROD axis orientation can be 
-        returned either in the sample reference frame, or in the rotated crystal reference frame. axis coordinates can be returned 
-        as cartesian (x,y,z) or polar (azimuth,dip) coordinates.
-        
-        To plot an ipf color map of axis orientation, use cartesian coordinates. These will then converted to an orix.vector.Vector3D
-        and passed to the direction color key to return a rgb array. Note: for axis orientation in the sample reference frame, 
-        use a full color key (symmetry='C1'), as the misorientation axes in specimen coordinates have no symmetry.   
-        
-        Args:
-        ---------
-        pixel_orientation      : pixel orientation array (ndarray of 3x3 orientation matrices). default is 'U'
-        reference_frame  (str) : reference frame for the misorientation axis. 'sample' or 'crystal'
-        axis_coordinates (str) : type of coordinates for the misorientation axis. 'cartesian' (x,y,z) or 'polar' (azimuth, dip)
-        degrees  (bool)        : return angles in degree. Otherwise, keep in radiant. default is True
-
-        
-        New attribute added to pixelmap:
-        GROD_angle: (1D array)
-        GROD axis: depends on the option specified in 'reference_frame' and 'coordinates'
-        GROD_axis_xyz / GROD_axis_xyz_c - shape (N,3) 
-        GROD_axis_polar / GROD_axis_polar_c - shape (N,2)
-        """
-        
-        assert pixel_orientation in self.titles(), 'pixel orientation data not recognized'
-        assert len(self.grains.glist) > 0, 'no grains in self.grains.glist. Need to compute grains first'
-        assert axis_coordinates in ['cartesian','polar'], 'coordinates system not recognized! must be cartesian or polar'
-        assert reference_frame in ['sample','crystal'], 'reference frame must be sample or crystal'
-        
-        # initialize new arrays for GROD angle + axis 
-        GROD_angle = np.full(self.xyi.shape, 0, dtype=float)   # default misorientation to 0
-        
-        if axis_coordinates == 'cartesian':
-            GROD_axis_xyz = np.full(self.xyi.shape+(3,),0,dtype=float)
-        else:
-            GROD_axis_polar = np.full(self.xyi.shape+(2,), 0, dtype=float)
-        
-        # select pixel orientations
-        U_px = self.get(pixel_orientation)    
-        
-        # loop through grain list and compute misorientation
-        for gi,g in tqdm.tqdm(zip(self.grains.gids, self.grains.glist)):
-            # select grain mask, phase name and symmetry
-            gm = self.grain_id == gi
-            pname = g.phase
-            phase = self.phases.get(pname).orix_phase
-            sym = phase.point_group.laue
-            
-            # get orientation in quaternion space and compute GROD in lab coordinates
-            ori_px  = oq.Orientation.from_matrix(U_px[gm], symmetry=sym).map_into_symmetry_reduced_zone()
-            ori_ref = oq.Orientation.from_matrix(g.U, symmetry=sym)   # already symmetry-reduced orientation
-            
-            # misorientation. respects right-hand rule convention: counter-clockwise rotation about misorientation axis counted positive
-            GROD = oq.Misorientation(ori_px*~ori_ref, symmetry=(sym,sym))
-            axis = GROD.axis.flatten()
-            
-            # crystal reference frame: rotate axis + project in fundamental zone
-            if reference_frame == 'crystal':
-                axis = ~ori_ref * axis
-                axis = axis.in_fundamental_sector(sym)
-            
-            # update GROD angle for the grain
-            if degrees:
-                GROD_angle[gm] = np.degrees(GROD.angle)
-            else:
-                GROD_angle[gm] = GROD.angle
-            
-            # update GROD axis for the grain
-            if axis_coordinates == 'cartesian':   
-                    GROD_axis_xyz[gm] = axis.data
-            else:
-                if degrees:
-                    az, dip = np.degrees(axis.azimuth), np.degrees(axis.polar)
-                else:
-                    az, dip = axis.azimuth, axis.polar
-                GROD_axis_polar[gm] = np.array([az,dip]).T
-            
-
-
-        
-        # add new arrays to xmap
-        self.add_data(GROD_angle, 'GROD_angle')
-        
-        if reference_frame == 'crystal':
-            c_sub = '_c'
-        else:
-            c_sub = ''
-            
-        if axis_coordinates == 'cartesian':   
-            self.add_data(GROD_axis_xyz, f'GROD_axis_xyz{c_sub}')
-        else:
-            self.add_data(GROD_axis_polar, f'GROD_axis_polar{c_sub}')
-            
                   
-            
-    
-    def plot(self, datacolname, phase=None, dim=0, save=False, hide_cbar=False, autoscale=False, hist_tails_cut = [2,98],
-             show_grain_boundaries=False, smooth=False, mf_size=1, out=False, **kwargs):
+    def plot(self, prop, phase=None, label = None, dim=0, save=False, hide_cbar=False, autoscale=False, hist_tails_cut = [2,98],
+             smooth=False, mf_size=1, show_gb=False, gb_res_fact = 1, gb_color='k', out=False, **kwargs):
         """ Plot colormap of data in column datacolname using pcolormesh
         
         Args:
         --------
-        datacolname (str): name of data array to plot)
+        prop             : str or lambda func. property to plot. Either data column in pixelmap (str), or function of one or multiple columns (labda func)
+                         e.g. prop = 'Npks'  (str) ; prop = lambda xmap: xmap.Npks (func)
         dim (int)        : for ndarray of shape (nx*ny,M), M>1, dimension M of the data array to plot
         phase (str)      : select phase to plot. If none, use the full map. required to show grain boundaries
+        label (str)      : property label. default is prop (str)
         save (bool)      : save plot (default is False)
         hide_cbar (bool) : hide colorbar from plot (delault is False)
         smooth (bool)    : apply median filter for smoothing
-        mf_size (int)    : size of median filter kernel for smoothing. default is 1 
+        mf_size (int)    : median filter kernel size. default is 1 
+        show_gb (bool)   : overlap grain boundaries. default is False. 
+        gb_res_fact / gb_color: controls grain boundaries aspect. see self.add_grain_boundaries
         out (bool)       : return figure as output (default is False)
         autoscale (bool) : automatically adjust color scale to distribution (default is False)
         hist_tails_cut   : percentile thresholds ([low,up]) to cut distribution (for autoscale). Default is [2,98]
@@ -857,21 +873,27 @@ class Pixelmap:
         xb, yb = self.grid.xbins, self.grid.ybins
         
         # select data to plot
-        data = self.get(datacolname)
+        if callable(prop):
+            data = prop(self)
+            if label is None:
+                label = get_lambda_expression(prop)
+        else:
+            data = self.get(prop)
+            if label is None:
+                label = prop
         
         if phase is not None:
-            mask = self.phase_id == self.phases.get(phase).phase_id
-
+            mask = self.get_phase_mask(phase)
             default_val = data[self.phase_id==-1][0]
             data[~mask] = default_val
 
         # reshape
         if len(data.shape) == 1:
             data2D = data.reshape(nx,ny)
-            title = f'{datacolname}'
+            title = f'{label}'
         else:
             data2D = data[:,dim].reshape(nx,ny)
-            title = f'{datacolname}_{dim}'
+            title = f'{label}_{dim}'
         
         if smooth:
             data2D = ndi.median_filter(data2D, size=mf_size)
@@ -889,27 +911,26 @@ class Pixelmap:
             im = ax.pcolormesh(xb, yb, data2D, rasterized=True, **kwargs)
         
         # add grain boundaries to plot 
-        if show_grain_boundaries:
+        if show_gb:
             assert phase is not None, "you need to select a phase to show grain boundaries"
-            self.add_grain_boundaries(phase, ax=ax, resolution_factor=3, gb_color='k')
+            self.add_grain_boundaries(phase, ax=ax, resolution_factor=gb_res_fact, gb_color=gb_color)
         
         ax.set_title(title)
         ax.add_artist(self.grid.scalebar())
         
         # colorbar
-        if not hide_cbar:
-            fig.suptitle(self.h5name.split('/')[-1].split('.h')[0], y=.9)
-            if 'phase_id' in datacolname:
-                cbar = pl.colorbar(im, ax=ax, orientation='vertical', pad=0.08, shrink=0.7, ticks = self.phases.pids)
-                cbar.ax.set_yticklabels(self.phases.pnames)
-                cbar.ax.set_rasterized(True)
-            else:
-                cbar = pl.colorbar(im, ax=ax, orientation='vertical', pad=0.08, shrink=0.7, label=datacolname)
-                cbar.ax.set_rasterized(True)
-                try:
-                    cbar.formatter.set_powerlimits((-1, 1)) 
-                except:  # cbar formatter does not work when LogNOrm is used 
-                    pass
+        fig.suptitle(self.h5name.split('/')[-1].split('.h')[0], y=.9)
+        if 'phase_id' in label:
+            cbar = pl.colorbar(im, ax=ax, orientation='vertical', pad=0.08, shrink=0.7, ticks = self.phases.pids)
+            cbar.ax.set_yticklabels(self.phases.pnames)
+            cbar.ax.set_rasterized(True)
+        else:
+            cbar = pl.colorbar(im, ax=ax, orientation='vertical', pad=0.08, shrink=0.7, label=label)
+            cbar.ax.set_rasterized(True)
+            try:
+                cbar.formatter.set_powerlimits((-1, 1)) 
+            except:  # cbar formatter does not work when LogNOrm is used 
+                pass
                 
         if hide_cbar:
             fig.suptitle(self.h5name.split('/')[-1].split('.h')[0], y=1.)
@@ -920,32 +941,34 @@ class Pixelmap:
             
             
             
-    def plot_voigt_tensor(self, datacolname, phase=None, autoscale=True, hist_tails_cut = [2,98], show_grain_boundaries=False,
-                          save=False, hide_cbar=False, smooth=False, mf_size=1, out=False, **kwargs):
-        """ plot all components of strain / stress tensor (voigt notation) in a single figure
+    def plot_strain_stress(self, datacolname, phase=None, autoscale=True, hist_tails_cut = [2,98], show_gb=False,
+                          gb_res_fact=1, gb_color='k', save=False, hide_cbar=False, smooth=False, mf_size=1, out=False, **kwargs):
+        """ plot all components of strain / stress tensor in a single figure. The strain/stress column must be in voigt-like format ((6,1) shape)
         
         Args: 
         ---------
         datacolname (str) : name of data array. data in self.datacolname must be a Nx6 array with strain / stress components
                             in the following order: e11,e22,e33,e23,e13,e12
-        phase (str)     : Add a mask to select only selected phase. If None, keep the full map. Required for show_grain_boundaries 
+        phase (str)     : Add a mask to select only selected phase. If None, keep the full map. Required for show_gb 
         autoscale (bool): automatically adjust color scale to distribution for each strain / stress component (default is True)
         percentile_cut  : percentile thresholds ([low,up]) to cut distribution (for autoscale). Default is [,98]
         save (bool)     : save plot (default is False)
         hide_cbar (bool): hide colorbar from plot (delault is False)
         smooth (bool)   : apply median filter for smoothing plot
-        mf_size (int)   : size of median filter kernel for smoothing. default is 1 
+        mf_size (int)   : median filter kernel size. default is 1 
+        show_gb (bool)   : overlap grain boundaries. default is False. 
+        gb_res_fact / gb_color: controls grain boundaries aspect. see self.add_grain_boundaries
         hist_tails_cut  : percentile thresholds ([low,up]) to cut distribution (for autoscale). Default is [2,98]
         out (bool)      : return figure as output (default is False)
         kwargs (dict)   : keyword arguments passed to matplotlib""" 
         
         nx, ny = self.grid.nx, self.grid.ny 
         xb, yb = self.grid.xbins, self.grid.ybins
-        voigt_tensor = self.get(datacolname)
+        data_array = self.get(datacolname)
         
         if phase is not None:
-            mask = self.phase_id == self.phases.get(phase).phase_id
-            voigt_tensor[~mask] = np.inf
+            mask = self.get_phase_mask(phase)
+            data_array[~mask] = np.inf
         
         # figures layout
         fig, ax = pl.subplots(2,3, figsize=(10,7), sharex=True, sharey=True)
@@ -953,10 +976,12 @@ class Pixelmap:
         
         if any(['strain' in datacolname, 'eps' in datacolname]):
             titles = 'e11,e22,e33,e23,e13,e12'.split(',')
-            main_title = 'strain_tensor_maps'
+            main_title = 'strain_components'
+            if 'voigt' in datacolname:
+                data_array = data_array * np.array([1,1,1,1/2,1/2,1/2])
         elif any(['stress' in datacolname, 'sigma' in  datacolname]):
             titles = 's11,s22,s33,s23,s13,s12'.split(',')
-            main_title = 'stress_tensor_maps'
+            main_title = 'stress_components'
         else:
             print('data name not recognized. Should contain either "strain"/"eps" or "stress"/"sigma"')
             return
@@ -965,10 +990,10 @@ class Pixelmap:
         for i, (a,t) in enumerate(zip(ax, titles)):
             a.set_aspect('equal')
             a.set_axis_off()
-            x = voigt_tensor[:,i].reshape(nx,ny)
+            x = data_array[:,i].reshape(nx,ny)
             if smooth:
                 x = ndi.median_filter(x, size=mf_size)
-            x_u = np.unique(voigt_tensor[voigt_tensor != float('inf')])  # select unique values to get distribution across grains  
+            x_u = np.unique(data_array[data_array != float('inf')])  # select unique values to get distribution across grains  
     
             # plots
             if autoscale:
@@ -979,9 +1004,9 @@ class Pixelmap:
                 im = a.pcolormesh(xb, yb, x, rasterized=True, **kwargs)
             a.set_title(t)
             
-            if show_grain_boundaries:
+            if show_gb:
                 assert phase is not None, "you need to select a phase to show grain boundaries"
-                self.add_grain_boundaries(phase, ax=a, resolution_factor=3, gb_color='k')
+                self.add_grain_boundaries(phase, ax=a, resolution_factor=gb_res_fact, gb_color=gb_color)
             
             # colorbar
             if not hide_cbar:
@@ -991,7 +1016,6 @@ class Pixelmap:
             
         # Adjust layout
         fig.tight_layout()
-        
         fig.suptitle(f'{main_title} – {self.dsname}', y=1.0)
 
         if save:
@@ -1001,7 +1025,7 @@ class Pixelmap:
             
         
     ## To remove: replace with function to compute distribution + summary statistics for a selected property of the map    
-    def hist_voigt_tensor(self, datacolname, percentile_cut=[2,98], nbins=100, save=False, out=False, **kwargs):
+    def hist_strain_stress(self, datacolname, percentile_cut=[2,98], nbins=100, save=False, out=False, **kwargs):
         """ plot histogram for all components of strain / stress tensor (voigt notation)
         
         Args: 
@@ -1014,23 +1038,25 @@ class Pixelmap:
         out (bool)     : return figure as output (default is False)
         kwargs (dict)  : keyword arguments """ 
         
-        voigt_tensor = self.get(datacolname)
+        data_array = self.get(datacolname)
         # figures layout
         fig, ax = pl.subplots(2,3, figsize=(10,6))
         ax = ax.flatten()
         
         if any(['strain' in datacolname, 'eps' in datacolname]):
             titles = 'e11,e22,e33,e23,e13,e12'.split(',')
-            main_title = 'strain_tensor_hist'
+            main_title = 'strain_components_histogram'
+            if 'voigt' in datacolname:
+                data_array = data_array * np.array([1,1,1,1/2,1/2,1/2])
         elif any(['stress' in datacolname, 'sigma' in  datacolname]):
             titles = 's11,s22,s33,s23,s13,s12'.split(',')
-            main_title = 'stress_tensor_hist'
+            main_title = 'stress_components_histogram'
         else:
             print('data name not recognized. Should contain either "strain"/"eps" or "stress"/"sigma"')
             return
           
         for i, (a,t) in enumerate(zip(ax, titles)):
-            x = voigt_tensor[:,i]
+            x = data_array[:,i]
             x_c = x[x != float('inf')]
             low, up = np.percentile(x_c, (percentile_cut[0],percentile_cut[1]))
             bins = np.linspace(low, up, nbins)
@@ -1048,30 +1074,80 @@ class Pixelmap:
         if out:
             return fig
             
-    
-    
-    
-    def plot_ipf_orientation(self, phase, datacolname='U',ipfdir = [0,0,1], ellipsoid = False, show_grain_boundaries=False, 
-                             smooth = False, mf_size=1, save=False, hide_cbar=False, out=False, **kwargs):
+
+    def get_ipf_orientations(self, phase, datacolname='U', ipf_directions = [(0,0,1)], ellipsoid=False, smooth = False, smooth_kernel_size = 3, smooth_threshold = 10):
+        """get IPF maps in selected sample directions, entered as a list of (x,y,z) tuples. Returns dictionnary of rgb maps for each direction.
+        If ipf_direction is set to 'xyz' (str), returns ipf colors in orthogonal xyz sample basis."""
+
+        assert phase in self.phases.pnames, 'phase name not recognized'
         
-        """ Plot inverse pole figure color map of orientation. 
+        #map grid
+        nx, ny = self.grid.shape
+        xb, yb = self.grid.xbins, self.grid.ybins
+    
+        # phase symmetry
+        cs =  self.phases.get(phase)
+        if ellipsoid:
+            cell = np.array([1,1,1,90,90,90])
+            uc = ImageD11.unitcell.unitcell(cell, symmetry=16)
+            sym = oq.symmetry.D2h
+        else:
+            uc = ImageD11.unitcell.unitcell(cs.cell, cs.spg_no)
+            sym = cs.orix_phase.point_group
+
+        # get pixel orientation
+        Umats = self.get(datacolname).copy()
+        
+        m_selec = (self.phase_id == cs.phase_id) & (self.nindx > 0)  #  mask for unindexed / bad pixels
+        
+        if smooth:
+            Umats_smooth = orientation.local_orientation_smooth_orix(Umats.reshape(nx,ny,3,3), sym, kernel_size=smooth_kernel_size,
+                                                                     global_mask = m_selec.reshape(nx,ny), local_mask=None,
+                                                                     threshold_deg=smooth_threshold)
+            Umats = Umats_smooth.reshape(nx*ny,3,3)
+        ori = uc.get_orix_orien_fast(Umats)
+       
+        # get rgb map from ipf orientations
+        if ipf_directions == 'xyz':
+            rgb_maps = {
+            'x': np.array([1, 0, 0]),
+            'y': np.array([0, 1, 0]),
+            'z': np.array([0, 0, 1])}
+            
+        else:
+            rgb_maps = {tuple(axis): np.asarray(axis) for axis in ipf_directions}
+
+        for key, axis in rgb_maps.items():
+            rgb = uc.get_ipf_colour_from_orix_orien(ori, axis=axis)
+            rgb[~m_selec, :] = 0  # set non-selected pixels to black
+            rgb_maps[key] = rgb
+
+        return rgb_maps
+    
+    
+    def plot_ipf_orientation(self, phase, datacolname='U', ipf_directions = [(0,0,1)], ellipsoid = False, show_color_key = True,
+                             smooth=False, smooth_kernel_size = 3, smooth_threshold = 10,
+                             show_gb=False, gb_res_fact=1, gb_color='w', save=False, hide_cbar=False, out=False, **kwargs):
+        
+        """ Plot IPF orientation color maps 
         
         Args:
         --------
         phase (str)    : name of the phase to plot. must be in self.phases
         datacolname (str)    : name of orientation data array. Default is 'U'. Must be a ndarray with shape (N,3)
-        ipfdir (array) : direction for the ipf colorkey in the laboratory reference frame.
+        ipf_directions (array) : direction for the ipf colorkey in the laboratory reference frame.
                          must be a 3x1 vector [x,y,z]. Default: z-vector [0,0,1]
-        smooth (bool)  : apply median filter for smoothing rgb colors (each r,g,b dimension is smoothed separately)
-        mf_size (int)  : size of median filter kernel for smoothing. default is 1 
+        smooth (bool)  : apply orientation smoothing before computing rgb colors
+        smooth_kernel_size, smooth_threshold : see orientation.local_orientation_smooth_orix
         ellipsoid (bool) : set symmetry to one of a triaxial ellipsoid (orthorombic, mmm).
                            For ipf color map of strain-stress principal components orientation
+        show_color_key (bool): plot ipf color key is separate figure. default is True
+        show_gb (bool)   : overlap grain boundaries. default is False. 
+        gb_res_fact / gb_color: controls grain boundaries aspect. see self.add_grain_boundaries
         save (bool)    : save plot (default is False)
         hide_cbar (bool) : hide colorbar from plot (delault is False)
         out (bool)     : return fig output (default is False)
         kwargs (dict)  : keyword arguments passed to matplotlib"""
-    
-        assert phase in self.phases.pnames
         
         #map grid
         nx, ny = self.grid.nx, self.grid.ny
@@ -1081,49 +1157,59 @@ class Pixelmap:
         cs =  self.phases.get(phase)
         if ellipsoid:
             sym = oq.symmetry.D2h
-            ipf_key = opl.IPFColorKeyTSL(sym, direction=ovec.Vector3d(ipfdir))
+            ipf_key = opl.IPFColorKeyTSL(sym, direction=ovec.Vector3d.zvector)
         else:
             sym = cs.orix_phase.point_group.laue
-            cs.get_ipfkey(direction = ovec.Vector3d(ipfdir))
+            cs.get_ipfkey(direction = ovec.Vector3d.zvector)
             ipf_key = cs.ipfkey
-            
-        # convert orientation data to color map
-        U = self.get(datacolname)
-        ori = oq.Orientation.from_matrix(U, symmetry=sym)
-        rgb = ipf_key.orientation2color(ori)
-        m  = self.phase_id == cs.phase_id
-        indx = self.nindx > 0
-        rgb[~m,:] = 0 # black pixels for phases other than the one selected
-        rgb[~indx,:] = 0  # keep unindexed pixels black
-        
-        rgb = rgb.reshape(nx,ny,3)
-        if smooth:
-            for d in range(3):
-                rgb[:,:,d] = ndi.median_filter(rgb[:,:,d], size=mf_size)
+        # get rgb maps
+        rgb_maps = self.get_ipf_orientations(phase, datacolname, ipf_directions, ellipsoid, smooth, smooth_kernel_size, smooth_threshold)
 
-        # plot orientation map 
-        fig = pl.figure(figsize=(8,8))
-        ax = fig.add_subplot(111, aspect ='equal')
-        ax.set_axis_off()
-        
-        im = ax.pcolormesh(xb, yb, rgb.reshape(nx,ny,3), rasterized=True, **kwargs)
-        ax.set_title(f'{phase} - ipf map {str(ipfdir)}')
-        ax.add_artist(self.grid.scalebar())
-        
-        if show_grain_boundaries:
-             self.add_grain_boundaries(phase, ax=ax, resolution_factor=3, gb_color='k')
-    
-        # plot color key
-        pl.matplotlib.rcParams.update({'font.size': 4})
-        fig.subplots_adjust(right=0.7)
-        ax1 = fig.add_axes([0.8, 0.25, 0.15, 0.15], projection='ipf',  symmetry=sym)
-        ax1.plot_ipf_color_key(show_title=False)
-        pl.matplotlib.rcParams.update({'font.size': 10})
-        fig.suptitle(self.h5name.split('/')[-1].split('.h')[0], y=.9)    
-    
+        # Figure ---- Layout: max 3 columns ----
+        n_maps = len(rgb_maps)
+        n_cols = min(3, n_maps)
+        n_rows = np.ceil( (n_maps)/n_cols).astype(int)
+
+        fig, axes = pl.subplots(n_rows, n_cols, figsize=(5*n_cols,5*n_rows))
+        if n_maps == 1:
+            axes = np.array([axes])
+            
+        axes = axes.ravel()
+        for ax in axes:
+            ax.set_axis_off()
+
+        for ax, (ipfdir, rgb) in zip(axes, rgb_maps.items()):
+
+            rgb = np.asarray(rgb)
+            # Normalize if RGB is 0–255
+            if rgb.dtype != float or rgb.max() > 1.0:
+                rgb = rgb.astype(float) / 255.0
+
+            im = ax.pcolormesh(xb, yb, rgb.reshape(nx,ny,3), rasterized=True, **kwargs)
+            ax.set_aspect("equal")
+            ax.set_title(f"{phase} IPF {str(ipfdir)}")
+            
+            if not hide_cbar:
+                ax.add_artist(self.grid.scalebar())
+            if show_gb:
+             self.add_grain_boundaries(phase, ax=ax, resolution_factor = gb_res_fact, gb_color = gb_color) 
+
+        # add color key
+        if show_color_key:
+            pl.matplotlib.rcParams.update({'font.size': 8})
+            fig_key = pl.figure(figsize=(3,3))
+            ax_key = fig_key.add_subplot(111, projection="ipf", symmetry=sym)
+            ax_key.plot_ipf_color_key(ipf_key)
+            #ipf_key.plot(ax_key)
+            pl.matplotlib.rcParams.update({'font.size': 10})
+
+        fig.suptitle(self.dsname, y=1.0)    
+        fig.tight_layout()
         if save:
-            ipfd_str = ''.join(map(str, ipfdir))
-            self.saveplot(fig, f'{phase}_ipf_{ipfd_str}')
+            self.saveplot(fig, f'{phase}_ipf_maps')
+            if show_color_key:
+                fname = os.path.basename(self.h5name).replace('.h5', f'{phase}_ipfkey.svg')
+                fig_key.savefig(fname)
         if out:
             return fig
             
@@ -1134,7 +1220,7 @@ class Pixelmap:
         subprocess.run(f'mkdir -p {savedir}'.split(' '), check=True)         
         
         fname = os.path.basename(self.h5name).replace('.h5', f'_{title}.svg')
-        fig.savefig('/'.join([savedir,fname]), format='svg')
+        fig.savefig('/'.join([savedir,fname]), format='svg', dpi=250)
         
         print(f'{title} saved to {savedir}')
         
@@ -1162,7 +1248,7 @@ class Pixelmap:
         # compute grain boundaries if not already done
         if f'gb_{pname}' not in self.titles():
             print(f'no grain boundaries for phase {pname}.Computing them now, using the default orientation column (U) and angle threshold (10°)')
-            self.map_grain_boundaries(pname)
+            self.calcGrains(pname, update_grain_id=False)
             
         
         # get 2D grain boundary mask, rescale it and skeletonize to get skinny boundaries
@@ -1264,6 +1350,25 @@ class Pixelmap:
         
 
 
+#############################
+def get_lambda_expression(func):
+    """
+    help function to extract the expression from a lambda function as a string, removing the object reference prefix (e.g., 'xmap.').
+    """
+    if callable(func):
+        # Get the source code of the lambda function
+        source = inspect.getsource(func).strip()
+        # Extract the part after `lambda` parameters and the colon
+        match = re.search(r'lambda\s+[\w\s,]*:\s*(.*)', source)
+        if match:
+            expression = match.group(1).strip()
+            # Remove any object reference like 'xmap.' from the expression
+            # This removes patterns like 'xmap.attr1' -> 'attr1'
+            expression = re.sub(r'\b\w+\.', '', expression)
+            return expression
+    return None
+
+
 # Save / load functions
 ##########################    
   
@@ -1331,6 +1436,7 @@ def load_from_hdf5(h5name, debug=0):
             print(f'cif path for phase {pname} invalid. Loading from saved file')
             crystal_structure.list_to_cif(cfile, 'tmp')
             cs = crystal_structure.CS(pname,pid,'tmp')
+            os.remove('tmp')
     
         if cs is not None:
             pixelmap.phases.add_phase(pname, cs)
