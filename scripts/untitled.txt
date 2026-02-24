@@ -1,0 +1,222 @@
+Here is a module 'local_indexing.py', aimed to perform crystal lattice indexing on a 2D grid. Initially, it was designed to run as a batch process launched from a terminal (main() function). I would like to be able to launch it from a jupyter notebook, for testing purposes. For this, I want to be able import the different functions defined in this module in my notebook, and split the content of the main() function in different cells. I would like to do the following:
+- rewrite this module to put the parallelization block outside the main function (define a specific parallelization function outside, so I can import it in the notebook
+- set options in Options module as global parameters passed to each worker
+
+please return:
+the updated main() function without the parallelization block inside
+the new run_ubi_parallel function containing parallelization logic
+instruction about how to set Options defined in the Options class global
+
+
+local_indexing.py
+""" 
+performs local indexing on  a series of datasets, using indexing parameters specified in input 
+"""
+
+
+# import required modules
+import argparse
+import os, sys, site, glob
+etc. 
+
+
+
+# Options obj to store input options for indexing. everything defined here needs to be accessed by all workers in Processpool
+class Options():
+    hkltol1        = 0.05   #  hkl tolerance parameter for indexing
+    hkltol2        = 0.03   # hkl tolerance parameter for refinement
+    etc
+
+    def __init__(self):
+        self.unitcell = None
+        self.sym = getattr(ImageD11.sym_u, self.symmetry)()         # define symmetry group
+        self.ncpu = len(os.sched_getaffinity(os.getpid())) - 1      # ncpu. by default, use all cpus available
+
+        
+######################################################################
+
+
+def load_data(pksfile, xmapfile, dsfile, parfile, pname):
+    # load needed files
+    return cf, xmap, cs
+    
+
+
+def pixel_ubi_fit( args ):
+    """ 
+    core indexing function
+    
+    outputs:
+    best_ubi : best UBI matrix
+    best_score : score of best_ubi. Tuple (nindx, drlv2), where nindx is the number of g-vectors assigned to best_ubi and
+    drlv2 the mean square deviation from the closest integer hkl indices for assigned g-vectors
+    """
+    px, OPTS = args # unpack arguments
+    
+    # reads Options 
+    unitcell    = OPTS.unitcell      # crystal unit cell to pass to ImageD11.indexer
+    symmetry    = OPTS.sym           # crystal symmetry (ImageD11.sym_u symmetry) to find unique orientations
+    hkltol1     = OPTS.hkltol1       # hkl tolerance parameter for indexing (see ImageD11.indexing)
+    hkltol2     = OPTS.hkltol2       # hkl tolerance parameter for refinement
+    minpks      = OPTS.minpks        # minimum number of g-vectors to consider a ubi as a possible match (see ImageD11.indexing)
+    minpks_prop = OPTS.minpks_prop   # minimum fraction of g-vectors over the selected pixel to consider a ubi as a possible match.
+    max_mult    = OPTS.max_mult      # maximum multplicity of hkl rings in which possible orientation match will be searched. 
+    nrings      = OPTS.nrings        # maximum number of hkl rings to search in 
+    ks          = OPTS.px_kernel_size # size of peak selection around a pixel: single pixel or kernel selection
+    maxpks      = OPTS.maxpks       # max nb of g-vectors to keep for first stage indexing. Refinement is then done using all peaks
+    
+    
+    default_output = px, np.zeros((3,3)), 0, 0  # default output returned if no ubi is found: px, ubi, nindx, drlv2
+    
+    [ core indexing logic]
+    
+    return px, best_ubi, best_score
+
+# module_level variable
+to_index=None
+
+def _init_worker(parfile, cs):
+    global to_index
+    global OPTS
+    ImageD11.cImageD11.cimaged11_omp_set_num_threads(1)
+    to_index = ImageD11.columnfile.colfile_from_hdf( 'to_index.h5' )
+    to_index.parameters.loadparameters(parfile)
+    to_index.xyi = to_index.xyi.astype(int)   # convert xyi to default int type, otherwise peaksearch takes forever
+    utils.update_colf_cell(to_index, cs.cell, cs.spg, cs.lattice_type, mute=True)  
+    print(f"[INIT] Worker PID {os.getpid()}: to_index loaded, Size = {utils.get_colf_size(to_index, disp=False):.2f} MB")
+
+
+def get_grain_props(UBI):
+    try:
+        g = ImageD11.grain.grain(UBI)
+        return g.U, g.unitcell
+    except Exception as e:   
+        return np.zeros((3,3)), np.zeros(6)
+
+
+def update_xmap(xmap, xyi_selec, results, pname, drlv2_max = 0.1, overwrite = True):
+    """ write indexing outputs in xmap. updates only pixels corresponding to the indexed phase. Also reset pixels to "notindexed" if no
+    orientation has been found or if indexing scores are too bad (nindx < nindx_min, drlv2 > drlv2_max
+    
+    Args:
+    xmap    : pixelmap in which results will be written
+    results : output from fitting process
+    pname   : name of the phase being indexed
+    drlv2_max : max threshold for drlv2. If a UBI is identified on a pixel with drlv2 > drlv2_mx, the pixel will be kept unindexed. Avoids dodgy UBIs
+    overwrite : if True, reset all pixels that have already been indexed pixels for the selected phase pname before writing new data.
+                Useful to set this option ot False when doing multiple tests on small subsets of the map.
+    """
+    
+     [assigns outputs to xmap]
+    return xmap
+        
+        
+        
+        
+#####################################################################
+#####################################################################
+    
+def main():
+    
+    args = parser.parse_args()
+    
+    # load data
+    #################################################################
+    print('\n=============================-')
+    print('load data...\n')
+    xmap, cf, cs = load_data(args.pksfile, args.xmapfile, args.dsfile, args.parfile, args.pname)
+    
+    # load Options for indexing
+    OPTS = Options()
+    OPTS.unitcell = ImageD11.unitcell.unitcell( cs.cell , cs.lattice_type)
+    
+    print('\n---------------------------------')
+    print(f'PARAMETERS FOR INDEXING:')
+    print(OPTS)
+    print('---------------------------------')
+    
+    
+    # prepare g-vectors to index and list of arguments to pass to local indexing function
+    #################################################################   
+    print('\n=============================')
+    print('prepare g-vectors for indexing...')
+    titles =  'gx gy gz xyi sum_intensity'.split()
+    gv_to_index = ImageD11.columnfile.colfile_from_dict( { name: cf.getcolumn(name) for name in titles } )
+    #gv_to_index.filter(to_index.sum_intensity > 50)    # optional : filter to remove some weak peaks
+
+    # sort by pixel index and save
+    gv_to_index.sortby('xyi')
+    utils.colf_to_hdf(gv_to_index, 'to_index.h5', save_mode='full')
+    
+    #list of pixels to indeX
+    xyi_selec = xmap.xyi[xmap.phase_id == cs.phase_id].astype(int)
+
+    
+    # argument list to pass to pixel_ubi_fit
+    argslist = [(px,OPTS) for px in xyi_selec]
+    
+    print(f'Number of pixels to process: {len(xyi_selec)}')
+        
+    # run local indexing in parallel
+    ################################################################# 
+    results = {}
+    print('\n=============================')
+    print('local indexing...')
+
+    ctx = multiprocessing.get_context('fork')
+    
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=max(OPTS.ncpu-1,1),
+        initializer = _init_worker,
+        initargs = (args.parfile, cs),
+        mp_context=ctx) as pool:
+            
+        for r in tqdm(pool.map( pixel_ubi_fit, argslist, chunksize=OPTS.chunksize), total=len(xyi_selec) ):
+            results[r[0]] = r[1:]
+
+    # add results to pixelmap
+    update_xmap(xmap, xyi_selec, results, args.pname, drlv2_max = 0.1, overwrite = True)
+
+    subprocess.run(f'rm to_index.h5'.split(' '), check=True)  # delete tmp to_index file
+
+    # make plots and save
+    #################################################################   
+    print('\n=============================')
+    print('Make plots and save')
+    for vec in [(0,0,1),(0,1,0),(1,0,0)]:
+        xmap.plot_ipf_orientation(args.pname, ipfdir = vec, smooth=True, mf_size=3, save=False, hide_cbar=False, out=False)
+    
+    var_to_plot = ['nindx','drlv2']
+    kw = {'cmap':'viridis'}
+
+    for var in var_to_plot:
+        xmap.plot(var, autoscale=True, smooth=True, mf_size=3, save=True, **kw)
+        
+    xmap.save_to_hdf5()
+    
+    print('DONE\n==============================================\n')
+    
+    
+    
+#####################################################################
+#####################################################################
+
+    
+parser = argparse.ArgumentParser(description='Local indexing (pixel-by-pixel')
+parser.add_argument('-pksfile', help='absolute path to peakfile', required=True)
+parser.add_argument('-xmapfile', help='absolute path to pixelmap file', required=True)
+parser.add_argument('-dsfile', help='absolute path to datset file', required=True)
+parser.add_argument('-parfile', help='absolute path to parameters file', required=True)   
+parser.add_argument('-pname', help='name of the phase to index. Must be in pixelmap.phases', required=True)  
+    
+
+if __name__ == "__main__":
+    main()
+        
+    
+
+        
+        
+
+
+    

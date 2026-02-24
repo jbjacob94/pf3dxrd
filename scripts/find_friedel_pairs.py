@@ -2,16 +2,21 @@
 Run Friedel pair search for all scans in a peakfile. Make the code parallel over each pair of scans (dty,-dty) to match
 """
 
-import os, sys, site, time
-import argparse
-import subprocess
+import os, sys, site, time, argparse, subprocess
+
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
 import numpy as np
-import pylab as pl
+import matplotlib.pyplot as pl
 from tqdm import tqdm
 import multiprocessing
 from multiprocessing import Pool
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextlib import contextmanager
+import datetime
+import json
 
 import ImageD11.columnfile
 import ImageD11.sinograms.dataset
@@ -27,39 +32,112 @@ sys.path.extend([project_root, site.getusersitepackages()])
 from pf3dxrd.pf3dxrd import utils, friedel_pairs
 
 
-# UPDATE OPTIONS HERE
-######################################################################
 
-class Options():
-    ## PAIRING OPTIONS
-    dist_max  = 1.5      # max distance for nearest-neighbour search
-    dist_step = 0.1      # distance step incrrase at each iteration
-    sf_tth    = 1.       # scale factor two-theta
-    sf_I      = 1.       # scale factor sum intensity
-    
-    ## PEAKS FILTERING
-    # before Friedel pair matching: remove weak peaks (background noise) + suspiciously strong peaks
-    Npx_min   = 3        # min nb of pixels
-    sumI_min  = 30       # min sum_intensity 
-    sumI_max  = 1e7      # max sum_intensity
-    
-    # after Friedel pairs identification. screen out dodgy friedel pairs from the output
-    max_tth_dist   = 1.     # max two-theta angle between two peaks in a pair (degree) 
-    max_eta_dist   = 1.     # max eta angle between two peaks in a pair (degree) 
-    max_omega_dist = 1.     # max omega angle between two peaks in a pair (degree) 
-    max_logI_dist  = 1.     # max intensity difference (in log units) between two peaks in a pair
-    
-    # MULTIPROCESSING OPTIONS
-    ncpu = len(os.sched_getaffinity( os.getpid() ))    # ncpu. by default, use all cpus available
-    chunksize = 4                                      # size of chunks passed to ProcessPoolExecutor
-    
-# END EDITABLE PART
+@contextmanager
+def suppress_stdout():
+    saved_stdout = sys.stdout
+    sys.stdout = open(os.devnull, 'w')
+    try:
+        yield
+    finally:
+        sys.stdout = saved_stdout
+
+
+@contextmanager
+def log_to_file(logfile_path):
+    """
+    Redirect all stdout/stderr output to both console and a logfile:
+        with log_to_file("run.log"):
+            main()
+    """
+    class Tee(object):
+        def __init__(self, *streams):
+            self.streams = streams
+        def write(self, data):
+            for s in self.streams:
+                s.write(data)
+                s.flush()
+        def flush(self):
+            for s in self.streams:
+                s.flush()
+    log = open(logfile_path, "a", buffering=1)
+    tee_out = Tee(sys.stdout, log)
+    tee_err = Tee(sys.stderr, log)
+
+    old_out, old_err = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = tee_out, tee_err
+    try:
+        yield
+    finally:
+        sys.stdout, sys.stderr = old_out, old_err
+        log.close()
+
+
+
+# Pairing options
 ######################################################################
-    
-    
+class Options:
+
+    def __init__(self):
+        # ---- PAIRING OPTIONS ----
+        self.dist_max     = 1.5      # max distance for nearest-neighbour search
+        self.dist_step    = 0.1      # distance step increase at each iteration
+        self.sf_tth       = 1.       # scale factor two-theta
+        self.sf_I         = 1.       # scale factor sum intensity
+        
+        # ---- PEAK FILTERING ----
+        self.Npx_min      = 3        # min nb of pixels
+        self.sumI_min     = 30       # min sum_intensity
+        self.sumI_max     = 1e7      # max sum_intensity
+        self.tth_max      = 30       # max two-theta (cut detector angles with incomplete rings)
+
+        # Post Friedal pair search filtering
+        self.max_tth_dist   = 1.     # max two-theta angle between two peaks in a pair (degree) 
+        self.max_eta_dist   = 1.     # max eta angle between two peaks in a pair (degree) 
+        self.max_omega_dist = 1.     # max omega angle between two peaks in a pair (degree) 
+        self.max_logI_dist  = 1.     # max intensity difference (in log units) between two peaks in a pair
+
+        # ---- Derived or system-dependent parameters ----
+        self.ncpu = len(os.sched_getaffinity(os.getpid())) - 1  # use all but one CPU by default
+        self.chunksize = 4                                      # chunk size for ProcessPoolExecutor
+
+    # ----- save/load methods -----
+
+    def to_dict(self):
+        d = {}
+        for k, v in self.__dict__.items():
+            d[k] = v
+        return d
+
+    def save(self, path="friedel_pairs_opts.json"):
+        """Save current options to a JSON file."""
+        with open(path, "w") as f:
+            json.dump(self.to_dict(), f, indent=4)
+        print(f"[SAVED] Options saved to {path}")
+
+    @classmethod
+    def load(cls, path="friedel_pairs_opts.json"):
+        """Load options from a JSON file."""
+        with open(path, "r") as f:
+            data = json.load(f)
+        obj = cls()
+        for k, v in data.items():
+            setattr(obj, k, v)
+        return obj
+
+    def __repr__(self):
+        params = ", ".join(f"{k}={v}" for k, v in self.__dict__.items() if not callable(v))
+        return f"<Options {params}>"
+        
     def __str__(self):
-        attrdict = {i: self.__getattribute__(i) for i in dir(self) if not i.startswith('__')}
-        return '\n'.join([f'{k}:{v}' for (k,v) in attrdict.items()])
+        attrs = []
+        for attr, value in self.__class__.__dict__.items():
+            if not attr.startswith('__') and not callable(getattr(self, attr, None)):
+                attrs.append(f"{attr}: {getattr(self, attr, None)}")
+        for attr, value in self.__dict__.items():
+            if not attr.startswith('__'):
+                attrs.append(f"{attr}: {value}")
+        return "\n".join(attrs)
         
 ######################################################################
 
@@ -95,7 +173,7 @@ def load_data(pksfile, dsfile, parfile, return_2D_peaks=False):
     items = 'n_ystep,n_ostep,ymin,ymax,ystep,omin,omax,ostep'.split(',')
     vals  = [ds.shape[0], ds.shape[1], ds.ymin, ds.ymax, ds.ystep, ds.omin, ds.omax, ds.ostep]
     for i,j in zip(items, vals):
-        print(f'{i}: {j:.1f}')
+        print(f'{i}: {j:.2f}')
         
     print('==============================')
     
@@ -152,7 +230,7 @@ def correct_distortion_eiger( cf, parfile,
     """
     
     spat = ImageD11.blobcorrector.eiger_spatial( dxfile = dxfile, dyfile = dyfile )
-    cf = ImageD11.columnfile.colfile_from_dict( spat( {t:cf.getcolumn(t) for t in cf.titles()} ) )
+    cf = ImageD11.columnfile.colfile_from_dict( spat( {t:cf.getcolumn(t) for t in cf.titles} ) )
     cf.parameters.loadparameters(parfile)
     cf.updateGeometry()
     return cf
@@ -196,17 +274,59 @@ def correct_distortion_frelon( cf, parfile, splinefile):
     
     return cf
 
+# Parallelization stuff
+#####################################################################
+_shared_cf = None
+_shared_ds = None
+
+def _pool_init(cf, ds):
+    """Initializer : each worker receives cf and ds only once"""
+    global _shared_cf, _shared_ds
+    _shared_cf, _shared_ds = cf, ds
 
 
-@contextmanager
-def suppress_stdout():
-    saved_stdout = sys.stdout
-    sys.stdout = open(os.devnull, 'w')
-    try:
-        yield
-    finally:
-        sys.stdout = saved_stdout
+def _process_ypair_wrapper(args):
+    """light Wrapper: reconstruct args tuple with shared objects."""
+    pair_id, dist_max, dist_step, sf_tth, sf_I, flag = args
+    full_args = (_shared_cf, _shared_ds, pair_id, dist_max, dist_step, sf_tth, sf_I, flag)
+    return friedel_pairs.process_ypair(full_args)
 
+
+def run_parallel_pairing(cf, ds, OPTS):
+    """
+    parallelize process_ypairs. Writes results in tmp/ when it is available.
+    """
+    subprocess.run('mkdir -p tmp'.split(), check=True)
+
+    # light Argslist : cf et ds excluded
+    argslist = [(pair_id, OPTS.dist_max, OPTS.dist_step, OPTS.sf_tth, OPTS.sf_I, False) for pair_id, _ in enumerate(ds.ypairs)]
+
+    ctx = multiprocessing.get_context('fork')   
+
+    with ProcessPoolExecutor(
+        max_workers=OPTS.ncpu,                 
+        mp_context=ctx,
+        initializer=_pool_init,              
+        initargs=(cf, ds),
+    ) as pool:
+
+        futures = {
+            pool.submit(_process_ypair_wrapper, a): i
+            for i, a in enumerate(argslist)
+        }
+
+        # write on the fly when a result is ready
+        for future in tqdm(
+            as_completed(futures),
+            total=len(futures),
+            desc='scan pairs completed'
+        ):
+            i = futures[future]
+            try:
+                r = future.result()
+                utils.colf_to_hdf(r, f'tmp/cfp_{i}.h5', save_mode='full')
+            except Exception as exc:
+                print(f'[ERROR] pair {i} raised: {exc}')
 
     
 #####################################################################
@@ -217,7 +337,7 @@ def main():
     # extract arguments & options
     #################################################################
     args = reformat_args(parser)
-    OPTS = Options()
+    OPTS = Options.load(args.pairing_options)
     
     print('\n---------------------------------')
     print(f'PARAMETERS FOR FRIEDEL PAIR SEARCH:')
@@ -229,12 +349,15 @@ def main():
     #################################################################
     cf, ds = load_data(args.pksfile, args.dsfile, args.parfile, args.use2Dpeaks)
     
-
+    print('\n====================\nDetector distortion correction...')
     if 'frelon' in ds.detector:
         cf = correct_distortion_frelon( cf, args.parfile, args.splinefile)
 
     elif 'eiger' in ds.detector:
-        cf = correct_distorsion_eiger(cf, parfile, dxfile = args.dxfile, dyfile=args.dyfile)
+        if (args.dxfile is None) or (args.dyfile is None):
+             cf = correct_distortion_eiger(cf, args.parfile)
+        else:            
+            cf = correct_distortion_eiger(cf, args.parfile, dxfile = args.dxfile, dyfile=args.dyfile)
     else:
         raise NameError('detector type not recognized')
     
@@ -242,57 +365,44 @@ def main():
     savedir = os.path.dirname(args.pksfile) 
     subprocess.run(f'mkdir -p {savedir}'.split(' '), check=True)
     
-    # filter dodgy peaks
+    # filter dodgy peaks 
     if 'Number_of_pixels' in cf.titles:
-        cf.filter(cf.Number_of_pixels >= OPTS.Npx_min)
+        npx = cf.Number_of_pixels
     elif 'number_of_pixels' in cf.titles:
-        cf.filter(cf.number_of_pixels >= OPTS.Npx_min)
+        npx = cf.number_of_pixels
     else:
         raise AttributeError('columnfile object has no attribute "Number_of_pixels" or "number_of_pixels"')
+
+    mask = (
+        (npx                >= OPTS.Npx_min)  &
+        (cf.sum_intensity   <= OPTS.sumI_max) &
+        (cf.sum_intensity   >= OPTS.sumI_min) &
+        (cf.tth             <= OPTS.tth_max))
+    cf.filter(mask)
+
+    # normalize intensity (lorentz polarization factor)
+    lf = ImageD11.refinegrains.lf(cf.tth, cf.eta)
+    cf.addcolumn(lf * cf.sum_intensity, 'norm_intensity')
     
-    cf.filter(cf.sum_intensity  <= OPTS.sumI_max)
-    cf.filter(cf.sum_intensity  >= OPTS.sumI_min)
-    
-    
-    # Prepare for pairing
+    #  match friedel pairs
     #################################################################
     # form pairs of dty scans
     print('\n====================\n====================\nForm pairs of dty scans and check symmetry')
     friedel_pairs.form_y_pairs(cf, ds, disp=True)
     friedel_pairs.check_y_symmetry(cf, ds, saveplot=True, fname_plot = os.path.join(savedir, ds.dsname+'_dty_alignment.png'))
     
-    # build argument list for parallel processing
-    argslist = []
-    for pair_id,_ in enumerate(ds.ypairs):
-        argslist.append((cf, ds, pair_id, OPTS.dist_max, OPTS.dist_step, OPTS.sf_tth, OPTS.sf_I, False))
-    
-    
-    # match friedel pairs in each pair of scans and write outputs in temporary files
-    #################################################################
+
     print('\nMatch Friedel pairs\n====================')
-    subprocess.run(f'mkdir -p tmp'.split(' '), check=True)  # tmp folder for outputs
-    
-    # simple loop without parallelization. For debugging purposes
-    #for i,a in tqdm(enumerate(argslist), total=len(argslist)):
-    #    r = friedel_pairs.process_ypair(a)
-    #    utils.colf_to_hdf(r, f'tmp/cfp_{str(i)}.h5', save_mode='full')
-    
-    with ProcessPoolExecutor() as pool:
-        pool.max_workers=OPTS.ncpu
-        pool.mp_context=multiprocessing.get_context('fork')
-        
-        for i,r in tqdm( enumerate(pool.map(friedel_pairs.process_ypair, argslist, chunksize = OPTS.chunksize)),
-                      total = len(argslist), desc = 'scan pairs completed'):
-            
-            outname = f'tmp/cfp_{str(i)}.h5'
-            utils.colf_to_hdf(r, outname, save_mode='full')
+    run_parallel_pairing(cf, ds, OPTS)
 
             
     # Extract outputs and merge
     #################################################################
     outputs = []
     with suppress_stdout():
-        for f in tqdm(os.listdir('tmp')):
+        for f in tqdm(sorted(os.listdir('tmp'))):
+            if not f.endswith('.h5'):
+                continue
             pks = ImageD11.columnfile.columnfile(f'tmp/{f}')
             outputs.append(pks)
 
@@ -302,7 +412,7 @@ def main():
     
     # update geometry: tth correction + relocate Friedel pairs in sample coordinates
     print('Correct geometry using Friedel pairs\n====================')
-    friedel_pairs.update_geometry_s3dxrd(cf_paired, ds, update_gvecs=True)
+    friedel_pairs.update_geometry_fpairs(cf_paired, ds, relocate_fpairs=True)
     
     # filter out dodgy pairs 
     print('Clean up paired peakfile\n====================')   
@@ -355,7 +465,7 @@ def main():
     
     # save data. The 'minimal' save mode means that only the necessary data columns are kept.
     print('\nSave paired peaks...')
-    utils.colf_to_hdf(cf_paired, os.path.join(savedir, os.path.basename(args.pksfile).replace('.h5','_p.h5')), save_mode='minimal')
+    utils.colf_to_hdf(cf_paired, os.path.join(savedir, ds.dsname+'_pk2d_p.h5'), save_mode='minimal')
     subprocess.run(f'rm -r tmp'.split(' '), check=True)  # delete tmp folder
     
     print('DONE\n==============================================\n')
@@ -372,12 +482,24 @@ parser.add_argument('-parfile', help='absolute path to parameters file', require
 parser.add_argument('-splinefile', help='spline file for detector distortion correction (frelon)', required=False)
 parser.add_argument('-dxfile', help='dx file for detectrot distortion correction (eiger)', required=False)
 parser.add_argument('-dyfile', help='dy file for detectrot distortion correction (eiger)', required=False)
+parser.add_argument('-pairing_options', help='pairing options saved in json file (optional)', required=False)
 parser.add_argument('-use2Dpeaks', default=False, help='If loading from a peak table, do not merge peaks in omega but use raw 2D peaks', required=False)   
   
     
     
 if __name__ == "__main__":
-    main()
+    # timestamped logfile name
+    args = parser.parse_args()
+    root = os.path.dirname(args.dsfile)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    logfile = os.path.join(root,f"fpairs_matching_{ts}.log")
+
+    print(f"\n[LOG] Writing output to {logfile}\n")
+
+    with log_to_file(logfile):
+        main()
+
+    print(f"\n[LOG] Completed. Full log saved to {logfile}\n")
         
         
   

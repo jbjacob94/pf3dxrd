@@ -4,13 +4,23 @@ performs local indexing on  a series of datasets, using indexing parameters spec
 
 
 # general modules
-import argparse
-import os, sys, site, glob
+import os, sys, site, time, glob, argparse, subprocess
+
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
 import h5py
-import pylab as pl
-import numpy as np
-import concurrent.futures, multiprocessing
 from tqdm import tqdm
+import matplotlib.pyplot as pl
+import numpy as np
+import multiprocessing
+from multiprocessing import Pool
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import contextmanager
+import datetime
+import json
+import pprint
 
 # ImageD11
 import ImageD11.sinograms.dataset
@@ -30,37 +40,134 @@ from pf3dxrd.pf3dxrd import utils, friedel_pairs, pixelmap, crystal_structure, p
 from interruptingcow import timeout
 import subprocess
 
-# UPDATE OPTIONS HERE
-######################################################################
 
-class Options():
-    hkltol1        = 0.10   #  hkl tolerance parameter for indexing
-    hkltol2        = 0.05   # hkl tolerance parameter for refinement
-    minpks         = 10     # minimum number of g-vectors to consider a ubi as a possible match
-    maxpks         = 5000   #cutoff value for peaks nb for 1st-round indexing
-    minpks_prop    = 0.1    # min. frac. of g-vecs over the selected pixel to consider a ubi as a possible match.
-    nrings         = 10      # maximum number of hkl rings to search in 
-    max_mult       = 12     # maximum multiplicity of hkl rings to search in
-    px_kernel_size = 3      # size of peak selection around a pixel: single pixel or nxn kernel
-    sym            = ImageD11.sym_u.hexagonal()   # crystal symmetry (ImageD11.sym_u symmetry)
-    ncpu           = len(os.sched_getaffinity( os.getpid() )) - 1     # ncpu. by default, use all cpus available
-    chunksize      = 100                                               # size of chunks passed to ProcessPoolExecutor
-    
-    
-# END EDITABLE PART
-######################################################################
-    def __init__(self):
-        Options.unitcell = None
+@contextmanager
+def suppress_stdout():
+    saved_stdout = sys.stdout
+    sys.stdout = open(os.devnull, 'w')
+    try:
+        yield
+    finally:
+        sys.stdout = saved_stdout
+
+
+@contextmanager
+def log_to_file(logfile_path):
+    """
+    Redirect all stdout/stderr output to both console and a logfile:
+        with log_to_file("run.log"):
+            main()
+    """
+    class Tee(object):
+        def __init__(self, *streams):
+            self.streams = streams
+        def write(self, data):
+            for s in self.streams:
+                s.write(data)
+                s.flush()
+        def flush(self):
+            for s in self.streams:
+                s.flush()
+    log = open(logfile_path, "a", buffering=1)
+    tee_out = Tee(sys.stdout, log)
+    tee_err = Tee(sys.stderr, log)
+
+    old_out, old_err = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = tee_out, tee_err
+    try:
+        yield
+    finally:
+        sys.stdout, sys.stderr = old_out, old_err
+        log.close()
+
         
+
+class Options:
+    """
+    Stores all parameters for local indexing.
+    Designed for easy serialization and Jupyter tuning.
+    """
+
+    def __init__(self):
+        # ---- Default numeric and logic parameters ----
+        self.hkltol1        = 0.05      # hkl tolerance parameter for indexing
+        self.hkltol2        = 0.03      # hkl tolerance parameter for refinement
+        self.minpks         = 10        # minimum number of g-vectors to consider a ubi as a possible match
+        self.maxpks         = 5000      # cutoff value for peaks number in 1st-round indexing
+        self.minpks_prop    = 0.1       # min fraction of g-vectors over pixel to consider a ubi match
+        self.nrings         = 10        # max number of hkl rings to search
+        self.max_mult       = 12        # max multiplicity of hkl rings to search
+        self.px_kernel_size = 3         # kernel size around pixel (1 = single pixel)
+        self.chunksize      = 20        # chunk size for ProcessPoolExecutor
+        self.symmetry       = 'cubic'   # symmetry: must be one of ['cubic', 'hexagonal', 'trigonal', 'rhombohedralP', 'trigonalP', 'tetragonal', 'orthorhombic', 'monoclinic_c', 'monoclinic_a', 'monoclinic_b', 'triclinic']
+
+        # ---- Derived or system-dependent parameters ----
+        self.unitcell = None
+        self.sym = getattr(ImageD11.sym_u, self.symmetry)()
+        self.ncpu = len(os.sched_getaffinity(os.getpid())) - 1  # use all but one CPU by default
+
+
+    # ----- save/load methods (for Jupyter <-> batch sync) -----
+
+    def to_dict(self):
+        """Convert current options to a plain dict."""
+        d = {}
+        for k, v in self.__dict__.items():
+            # skip unserializable fields like unitcell or ImageD11 objects
+            if k in ['sym', 'unitcell']:
+                continue
+            d[k] = v
+        return d
+
+    def save(self, path="indexing_options.json"):
+        """Save current options to a JSON file."""
+        with open(path, "w") as f:
+            json.dump(self.to_dict(), f, indent=4)
+        print(f"[SAVED] Options saved to {path}")
+
+    @classmethod
+    def load(cls, path="indexing_options.json"):
+        """Load options from a JSON file."""
+        with open(path, "r") as f:
+            data = json.load(f)
+        obj = cls()
+        for k, v in data.items():
+            setattr(obj, k, v)
+        # reinitialize symmetry object
+        obj.sym = getattr(ImageD11.sym_u, obj.symmetry)()
+        print(f"[LOADED] Options loaded from {path}")
+        return obj
+
+    def __repr__(self):
+        params = ", ".join(f"{k}={v}" for k, v in self.__dict__.items() if not callable(v))
+        return f"<Options {params}>"
         
     def __str__(self):
-        attrdict = {i: self.__getattribute__(i) for i in dir(self) if not i.startswith('__')}
-        return '\n'.join([f'{k}:{v}' for (k,v) in attrdict.items()])
+        attrs = []
+        for attr, value in self.__class__.__dict__.items():
+            if not attr.startswith('__') and not callable(getattr(self, attr, None)):
+                attrs.append(f"{attr}: {getattr(self, attr, None)}")
+        for attr, value in self.__dict__.items():
+            if not (attr.startswith('__') or attr == 'sym'):
+                attrs.append(f"{attr}: {value}")
+        return "\n".join(attrs)
+
+    def setsymmetry(self,symmetry=None):
+        if symmetry is None:
+            symmetry = self.symmetry
+        else:
+            assert symmetry in ['cubic', 'hexagonal', 'trigonal', 'rhombohedralP', 'trigonalP', 'tetragonal', 'orthorhombic', 'monoclinic_c', 'monoclinic_a', 'monoclinic_b', 'triclinic'], 'symmetry not recognized'
+            self.__setattr__('symmetry', symmetry)
+        
+        self.sym = getattr(ImageD11.sym_u, self.symmetry)()
+        print(f"updated symmetry to {self.symmetry}. Symmetry group defined in self.sym.group")
+
+    
         
 ######################################################################
 
-
-
+# Loading
+###########
 def load_data(pksfile, xmapfile, dsfile, parfile, pname):
     # paths
     ds = ImageD11.sinograms.dataset.load(dsfile)
@@ -82,13 +189,125 @@ def load_data(pksfile, xmapfile, dsfile, parfile, pname):
     
     # add pixel labeling to cf + sort by pixel index
     peak_mapping.add_pixel_labels(cf, ds)
-    cf.sortby('xyi')
+    #cf.sortby('xyi')
     
     return xmap, cf, cs
 
 
+# parallel computing stuff
+############
 
-def pixel_ubi_fit( args ):
+# ── Global worker state ──────────────────────────────────────────────────────
+to_index = None
+
+def _init_worker(to_index_obj):
+    global to_index
+    # Force 1 thread per worker
+    ImageD11.cImageD11.cimaged11_omp_set_num_threads(1)
+    to_index = to_index_obj
+    # debug
+    #print(f"[Worker {os.getpid()}] to_index received ({to_index.nrows} rows)")
+
+
+def run_indexing_parallel(argslist, OPTS, parfile, cs):
+    """
+    Runs the local indexing in parallel
+    
+    Parameters
+    ----------
+    argslist : list of tuples
+        Chaque élément est (pixel, OPTS)
+    OPTS : Options
+        Options globales
+    parfile : str
+        Chemin vers le fichier de paramètres
+    cs : dataset/phase object
+        Structure cristalline
+    
+    Returns
+    -------
+    dict
+        {pixel: (best_ubi, N_indexed, drlv2_average)}
+    """
+    
+    print('\n=============================')
+    print('Loading to_index.h5...')
+    
+    to_index = ImageD11.columnfile.colfile_from_hdf('to_index.h5')
+    to_index.parameters.loadparameters(parfile)
+    to_index.xyi = to_index.xyi.astype(int)
+    utils.update_colf_cell(to_index, cs.cell, cs.spg, cs.lattice_type, mute=True)
+    
+    size_mb = utils.get_colf_size(to_index, disp=False)
+    print(f"to_index loaded: {to_index.nrows} rows, {size_mb:.2f} MB")
+    
+    print('\n=============================')
+    print('Local indexing...')
+    
+    ctx = multiprocessing.get_context('fork')  
+    
+    with ProcessPoolExecutor(
+        max_workers=max(OPTS.ncpu, 1),
+        mp_context=ctx,
+        initializer=_init_worker,
+        initargs=(to_index,)          
+    ) as pool:
+        
+        futures = {
+            pool.submit(pixel_ubi_fit, a): a[0]   #a[0] = pixel
+            for a in argslist}
+        
+        results = {}
+        
+        #with suppress_stdout():
+        for future in tqdm(
+            as_completed(futures),
+            total=len(futures),
+            desc='pixels indexed'
+            ):
+            pixel = futures[future]
+            
+            try:
+                r = future.result()  # (px, ubi, N, drlv2, ...)
+                results[pixel] = r[1:]  # pixel from dict
+            except Exception as exc:
+                print(f'[ERROR] Pixel {pixel} raised: {exc}')
+    
+    return results
+
+
+# Testing
+######################
+@contextmanager
+def indexing_context(parfile, cs):
+    """
+    Context manager to load and setup to_index and clean afterwards
+    Usage
+    -----
+    with indexing_context(parfile, cs):
+        result1 = pixel_ubi_fit((px1, OPTS))
+        result2 = pixel_ubi_fit((px2, OPTS))
+    """
+    global to_index
+    
+    to_index = ImageD11.columnfile.colfile_from_hdf('to_index.h5')
+    to_index.parameters.loadparameters(parfile)
+    to_index.xyi = to_index.xyi.astype(int)
+    utils.update_colf_cell(to_index, cs.cell, cs.spg, cs.lattice_type, mute=True)
+    ImageD11.cImageD11.cimaged11_omp_set_num_threads(1)
+    
+    size_mb = utils.get_colf_size(to_index, disp=False)
+    print(f"to_index loaded: {to_index.nrows} rows, {size_mb:.2f} MB\n")
+    
+    try:
+        yield to_index
+    finally:
+        to_index = None
+
+
+# CORE FUNCTION
+######################################
+def pixel_ubi_fit( args , loginfo=False):
     """ 
     fit ubi pixel-by-pixel. a list of possible UBI matrices matching with g-vectors over the selected pixel is found runing
     ImageD11.indexing. Then, each ubi is scored and the best-matching one is retained.
@@ -97,6 +316,7 @@ def pixel_ubi_fit( args ):
     best_ubi : best UBI matrix
     best_score : score of best_ubi. Tuple (nindx, drlv2), where nindx is the number of g-vectors assigned to best_ubi and
     drlv2 the mean square deviation from the closest integer hkl indices for assigned g-vectors
+    completeness : fraction of indexed intensity over total intensity (from peak_mapping.refine_px_ubi_fast)
     """
     px, OPTS = args
     
@@ -113,28 +333,37 @@ def pixel_ubi_fit( args ):
     maxpks      = OPTS.maxpks       # max nb of g-vectors to keep for first stage indexing. Refinement is then done using all peaks
     
     
-    default_output = px, np.zeros((3,3)), 0, 0  # default output returned if no ubi is found: px, ubi, nindx, drlv2
+    default_output = px, np.zeros((3,3)), np.nan, np.nan, np.nan  # default output returned if no ubi is found: px, ubi, nindx, drlv2, completeness
     
-    # select peaks from px
+    # select peaks from px. 2 selection windows: s_l (large) and s (normal) respectively for indexing and refinement
     s = peak_mapping.pks_from_px(to_index.xyi, px, kernel_size=ks)
+    #s_l = peak_mapping.pks_from_px(to_index.xyi, px, kernel_size=ks+2)
+    
     if len(s) == 0:
         return default_output
         
-    # subset gv for first indexing: take the N-strongest gvecs only. 
+    # subset gv for first indexing: take the N-strongest gvecs in s_l only. 
+    #p = min(maxpks/len(s_l),1) * 100
     p = min(maxpks/len(s),1) * 100
-    cut = to_index.sum_intensity[s] >= np.percentile(to_index.sum_intensity[s],100-p)
+    #cut = to_index.norm_intensity[s_l] >= np.percentile(to_index.norm_intensity[s_l],100-p)
+    cut = to_index.norm_intensity[s] >= np.percentile(to_index.norm_intensity[s],100-p)
 
-    
     # prepare indexer
     ###########################################################################
-    gvecs = np.array( (to_index.gx[s],to_index.gy[s],to_index.gz[s])).T.copy()
+    #gvecs_l = np.array( (to_index.gx[s_l],to_index.gy[s_l],to_index.gz[s_l])).T.astype(np.float64)
+    #gv = gvecs_l[cut]
+    gvecs = np.array( (to_index.gx[s],to_index.gy[s],to_index.gz[s])).T.astype(np.float64)
     gv = gvecs[cut]
+
+    if loginfo:
+        print(f'ngvecs: total:{len(gvecs)}, selec:{len(gv)}') 
+    
     ImageD11.indexing.loglevel=10  # loglevel set to high value to avoid outputs from indexer
     ind = ImageD11.indexing.indexer( unitcell = unitcell,
                                      gv = gv,
                                      wavelength=to_index.parameters.get('wavelength'),
                                      hkl_tol= hkltol1,
-                                     cosine_tol = np.cos(np.radians(90-1.)),
+                                     cosine_tol = np.cos(np.radians(90-.5)),
                                      ds_tol = 0.005,
                                      minpks = max(minpks, len(gv) * minpks_prop),
                                       )
@@ -146,7 +375,7 @@ def pixel_ubi_fit( args ):
         return default_output
     
     
-    # find possible ubis
+    # find list of matching ubis
     ###########################################################################
     # list of hkl rings to search in
     rings = [] 
@@ -169,7 +398,7 @@ def pixel_ubi_fit( args ):
             if ind.hits is None or len(ind.hits) == 0:
                 continue
             try:
-                with timeout(1.5, exception=RuntimeError):
+                with timeout(1., exception=RuntimeError):
                     ind.scorethem()
             except RuntimeError:
                 #print(f'rings ({r1},{r2}): timeout')
@@ -180,44 +409,46 @@ def pixel_ubi_fit( args ):
     if len(ind.ubis) ==0:
         return default_output
     
-    # Refinement, scoring and selection of best ubi
+    # score and select best ubi
     ###########################################################################    
     scores = []        # score = (npks_index, mean_drlv2) for each ubi found
     scoreproduct = []  # defined as npks_indexed/mean_drlv2. The higher the better
     nindx = []         # nb of peaks retained by score_and_refine. The higher the better
     ubis = []          # write refined ubit to new list
+
+    if loginfo:
+        print(f'UBI guesses:\n')
+        for ubi in ind.ubis:
+            print(f'{ImageD11.sym_u.find_uniq_u( ubi, symmetry )}\n')
     
-    # compute scores for all ubis found
+    # compute scores (nindfx, drlv2 mean) for all ubis found
     for i,ubi in enumerate(ind.ubis):
-        sc = ImageD11.cImageD11.score_and_refine( ubi, gvecs, hkltol2 ) 
+        sc = ImageD11.cImageD11.score_and_refine( ubi, np.ascontiguousarray(gvecs), hkltol2 )    # np.ascontiguousarray: avoids C extension making a copy of the array and returning annoying warning message
         scores.append(sc)
         scoreproduct.append(sc[0]/sc[1])
         nindx.append(sc[0])
         ubis.append( ImageD11.sym_u.find_uniq_u( ubi, symmetry ) )
+        if loginfo:
+            print(f'ubi:\n{ubis[i]}\nscore:{sc}, {scoreproduct[i]}\n') 
     
     if len(ubis) == 0:   # no ubi found
         return default_output
-    # select the best ubi: highest scoreproduct
+    # select the best ubi that maximizes ratio nindx/drlv2 
     nindx = [sc[0] for sc in scores]
-    best_indx =  np.argmax(scoreproduct)
-    best_score, best_ubi = scores[best_indx], ubis[best_indx]
-    
-    return px, best_ubi, best_score[0], best_score[1]
+    drlv2 = [sc[1] for sc in scores]
+    best  =  np.argmax(scoreproduct)
+    best_score, best_ubi = scores[best], ubis[best]
 
-# module_level variable
-to_index=None
+    # 2nd stage refinement for best ubi: exclude dodgy g-vectors and recompute ubi using g-vectors merged by hkl (better orientation fit)
+    ints = to_index.norm_intensity[s]
+    ubi = best_ubi
+    out = peak_mapping.refine_px_ubi_fast(gvecs, ints, ubi, hkltol2)   # out: (ubi_refined, drlv2, nindx, completeness, ang_shift)
 
-def doinit(parfile, cs):
-    global to_index
-    ImageD11.cImageD11.cimaged11_omp_set_num_threads(1)
-    to_index = ImageD11.columnfile.colfile_from_hdf( 'to_index.h5' )
-    to_index.parameters.loadparameters(parfile)
-    to_index.xyi = to_index.xyi.astype(int)   # convert xyi to default int type, otherwise peaksearch takes forever
-    utils.update_colf_cell(to_index, cs.cell, cs.spg, cs.lattice_type, mute=True)  
-    print(f"[INIT] Worker PID {os.getpid()}: to_index loaded, Size = {utils.get_colf_size(to_index, disp=False):.2f} MB")
+    return px, out[0], out[1], out[2], out[3]
 
 
-    
+# Extract & write outputs
+#############################
 def get_grain_props(UBI):
     try:
         g = ImageD11.grain.grain(UBI)
@@ -236,7 +467,7 @@ def update_xmap(xmap, xyi_selec, results, pname, drlv2_max = 0.1, overwrite = Tr
     results : output from fitting process
     pname   : name of the phase being indexed
     drlv2_max : max threshold for drlv2. If a UBI is identified on a pixel with drlv2 > drlv2_mx, the pixel will be kept unindexed. Avoids dodgy UBIs
-    overwrite : if True, reset all pixels that have already been indexed pixels for the selected phase pname before writing new data.
+    overwrite : if True, reset all pixels that have already been indexed for the selected phase pname before writing new data.
                 Useful to set this option ot False when doing multiple tests on small subsets of the map.
     """
     
@@ -247,10 +478,10 @@ def update_xmap(xmap, xyi_selec, results, pname, drlv2_max = 0.1, overwrite = Tr
     #####################################################################
     lx = xmap.xyi.shape
     #initialization
-    dnames = 'nindx drlv2 U UBI unitcell'.split(' ')
-    dshapes = [lx, lx, lx+(3,3), lx+(3,3), lx+(6,)]
-    initvals = [-1, -1, 0, -10, 0]
-    dtypes = [np.int32, np.float64, np.float64, np.float64, np.float64]
+    dnames = 'nindx drlv2 indx_completeness U UBI unitcell'.split(' ')
+    dshapes = [lx, lx, lx, lx+(3,3), lx+(3,3), lx+(6,)]
+    initvals = [-1, -1, 0, 0, 0, 0]
+    dtypes = [np.int32, np.float64, np.float64, np.float64, np.float64, np.float64]
     
     # add arrays to xmap if not yet present
     for n,shp,ival,dt in zip(dnames, dshapes, initvals, dtypes):
@@ -260,8 +491,9 @@ def update_xmap(xmap, xyi_selec, results, pname, drlv2_max = 0.1, overwrite = Tr
             xmap.add_data(ary,n)
         
         if overwrite:
+            # reset all pixels for the selected phase
             sel = xmap.phase_id == pid
-            xmap.update_pixels(xmap.xyi[sel], n, ary[sel])
+            xmap.update_pixels(n, ary[sel], xyi_indx = xmap.xyi[sel])
     
     
     # update xmap with results
@@ -270,116 +502,97 @@ def update_xmap(xmap, xyi_selec, results, pname, drlv2_max = 0.1, overwrite = Tr
     UBI   =  np.array([results[px][0] for px in xyi_selec])
     nindx =  np.array([results[px][1] for px in xyi_selec])
     drlv2 =  np.array([results[px][2] for px in xyi_selec])
+    compl =  np.array([results[px][3] for px in xyi_selec])    
     
     gprops = [get_grain_props(m) for m in UBI]
     U = np.array([gp[0] for gp in gprops])
     unitcell = np.array([gp[1] for gp in gprops])
     
     print('updating xmap...')
-    xmap.update_pixels(xyi_selec, 'UBI', UBI)
-    xmap.update_pixels(xyi_selec, 'nindx', nindx)
-    xmap.update_pixels(xyi_selec, 'drlv2', drlv2)
-    xmap.update_pixels(xyi_selec, 'U', U)
-    xmap.update_pixels(xyi_selec, 'unitcell', unitcell)
+    xmap.update_pixels('UBI', UBI, xyi_indx = xyi_selec)  
+    xmap.update_pixels('nindx', nindx, xyi_indx = xyi_selec)
+    xmap.update_pixels('drlv2', drlv2, xyi_indx = xyi_selec)
+    xmap.update_pixels('indx_completeness', compl, xyi_indx = xyi_selec)
+    xmap.update_pixels('U', U, xyi_indx = xyi_selec)
+    xmap.update_pixels('unitcell', unitcell, xyi_indx = xyi_selec)
     
-    
-    # filter out bad pixels (drlv2 too high)
+    # filter out bad pixels (drlv2 too high, indexing error)
     #####################################################################
-    bad = xmap.drlv2 > drlv2_max
+    # build boolean mask from xyi_selec -> selection of pixels being indexed
+    selec = np.full(xmap.xyi.shape, False)
+    pxindx = np.searchsorted(xmap.xyi, xyi_selec)
+    selec[pxindx] = True
+    # boolean mask for bad indexing
+    bad = np.any([xmap.drlv2 > drlv2_max, xmap.nindx <= 0], axis=0)
+    
     
     for n,shp,ival,dt in zip(dnames, dshapes, initvals, dtypes):
         ary = np.full(shp, ival, dt)               
-        xmap.update_pixels(xmap.xyi[bad], n, ary[bad])
+        xmap.update_pixels(n, ary[bad*selec], selection_mask = bad*selec)
+    xmap.phase_id[bad*selec] = -1   # reset bad pixels to 'notindexed' 
 
         
         
-        
-        
+          
 #####################################################################
 #####################################################################
     
 def main():
-    
     args = parser.parse_args()
-    
-    # load data
-    #################################################################
+
+    # --- Load data
     print('\n=============================-')
     print('load data...\n')
     xmap, cf, cs = load_data(args.pksfile, args.xmapfile, args.dsfile, args.parfile, args.pname)
-    
-    # load Options for indexing
-    OPTS = Options()
-    OPTS.unitcell = ImageD11.unitcell.unitcell( cs.cell , cs.lattice_type)
-    
+
+    if 'norm_intensity' not in cf.titles:
+        lf = ImageD11.refinegrains.lf(cf.tth, cf.eta)  # lorentz factor for intensity scaling
+        cf.addcolumn(cf.sum_intensity * lf, 'norm_intensity')
+
+    # --- Initialize options
+    if os.path.exists(args.indexing_pars):
+        print(f'loading options from {os.path.basename(args.indexing_pars)}')
+        OPTS = Options.load(args.indexing_pars)
+    else:
+        OPTS = Options()  # use default if no option file found
+    OPTS.setsymmetry()
+    OPTS.unitcell = ImageD11.unitcell.unitcell(cs.cell, cs.lattice_type)
     print('\n---------------------------------')
-    print(f'PARAMETERS FOR INDEXING:')
+    print('PARAMETERS FOR INDEXING:')
     print(OPTS)
     print('---------------------------------')
-    
-    
-    # prepare g-vectors to index and list of arguments to pass to local indexing function
-    #################################################################   
+
+    # --- Prepare data for indexing
     print('\n=============================')
     print('prepare g-vectors for indexing...')
-    titles =  'gx gy gz xyi sum_intensity'.split()
-    gv_to_index = ImageD11.columnfile.colfile_from_dict( { name: cf.getcolumn(name) for name in titles } )
-    #gv_to_index.filter(to_index.sum_intensity > 50)    # optional : filter to remove some weak peaks
-
-    # sort by pixel index and save
-    gv_to_index.sortby('xyi')
+    titles = 'gx gy gz xyi norm_intensity'.split()
+    gv_to_index = ImageD11.columnfile.colfile_from_dict(
+        {name: cf.getcolumn(name) for name in titles}
+    )
+    if not cf.sortedby == 'xyi':
+        gv_to_index.sortby('xyi')
     utils.colf_to_hdf(gv_to_index, 'to_index.h5', save_mode='full')
-    
-    #list of pixels to indeX
-    # FULL MAP
+
     xyi_selec = xmap.xyi[xmap.phase_id == cs.phase_id].astype(int)
+    argslist = [(px, OPTS) for px in xyi_selec]
 
-    # RECTANGULAR SUBSET: uncomment these lines if you want to index only a subset of the map
-    #sel = np.all([np.abs(xmap.xi-1540) < 80, np.abs(xmap.yi - 580) < 80, xmap.phase_id == cs.phase_id], axis=0)
-    #xyi_selec = xmap.xyi[sel]
-    
-    # argument list to pass to pixel_ubi_fit
-    argslist = [(px,OPTS) for px in xyi_selec]
-    
     print(f'Number of pixels to process: {len(xyi_selec)}')
-        
-    # run local indexing in parallel
-    ################################################################# 
-    results = {}
-    print('\n=============================')
-    print('local indexing...')
 
-    ctx = multiprocessing.get_context('fork')
-    
-    with concurrent.futures.ProcessPoolExecutor(
-        max_workers=max(OPTS.ncpu-1,1),
-        initializer = doinit,
-        initargs = (args.parfile, cs),
-        mp_context=ctx) as pool:
-            
-        for r in tqdm(pool.map( pixel_ubi_fit, argslist, chunksize=OPTS.chunksize), total=len(xyi_selec) ):
-            results[r[0]] = r[1:]
+    # --- Run parallel indexing
+    results = run_indexing_parallel(argslist, OPTS, args.parfile, cs)
 
-    # add results to pixelmap
-    update_xmap(xmap, xyi_selec, results, args.pname, drlv2_max = 0.1, overwrite = True)
+    # --- Update maps and finalize
+    update_xmap(xmap, xyi_selec, results, args.pname, drlv2_max=0.1, overwrite=True)
+    subprocess.run('rm to_index.h5'.split(), check=True)
 
-    subprocess.run(f'rm to_index.h5'.split(' '), check=True)  # delete tmp to_index file
-
-    # make plots and save
-    #################################################################   
     print('\n=============================')
     print('Make plots and save')
-    for vec in [(0,0,1),(0,1,0),(1,0,0)]:
-        xmap.plot_ipf_orientation(args.pname, ipfdir = vec, smooth=True, mf_size=3, save=False, hide_cbar=False, out=False)
+    xmap.plot_ipf_orientation(args.pname, ipf_directions='xyz', save=True)
     
-    var_to_plot = ['nindx','drlv2']
-    kw = {'cmap':'viridis'}
+    for var in ['nindx', 'drlv2', 'indx_completeness']:
+        xmap.plot(var, autoscale=True, smooth=False, save=True, cmap='viridis')
 
-    for var in var_to_plot:
-        xmap.plot(var, autoscale=True, smooth=True, mf_size=3, save=True, **kw)
-        
     xmap.save_to_hdf5()
-    
     print('DONE\n==============================================\n')
     
     
@@ -393,12 +606,23 @@ parser.add_argument('-pksfile', help='absolute path to peakfile', required=True)
 parser.add_argument('-xmapfile', help='absolute path to pixelmap file', required=True)
 parser.add_argument('-dsfile', help='absolute path to datset file', required=True)
 parser.add_argument('-parfile', help='absolute path to parameters file', required=True)   
+parser.add_argument('-indexing_pars', help='indexing parameters saved in json file (optional)', required=False)
 parser.add_argument('-pname', help='name of the phase to index. Must be in pixelmap.phases', required=True)  
     
 
 if __name__ == "__main__":
-    main()
-        
+    # timestamped logfile name
+    args = parser.parse_args()
+    root = os.path.dirname(args.dsfile)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    logfile = os.path.join(root,f"local_indexing_{ts}.log")
+
+    print(f"\n[LOG] Writing output to {logfile}\n")
+
+    with log_to_file(logfile):
+        main()
+
+    print(f"\n[LOG] Completed. Full log saved to {logfile}\n")
     
 
         
