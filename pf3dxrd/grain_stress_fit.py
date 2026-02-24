@@ -55,6 +55,7 @@ def solve_strain_stress(EpsSigSolver, ubis, pname, **kwargs):
     if reference_frame == 'Lab':
         ess.strain2stress_Lab(m = m_exponent)
     else:
+        reference_frame = 'Ref'
         ess.strain2stress_Ref(m = m_exponent)
         
     # compute additional properties : deviatoric tensor, eigen decomposition etc.
@@ -108,23 +109,28 @@ def xmap_strain_stress_px(xmap, pname, stress_unit='MPa', B0 = None, overwrite_x
     
     ess = cs.to_EpsSigSolver()  
     ess.stress_unit=stress_unit
+    print(f'computing strain with d_zero unitcell: {ess.unitcell}')
 
     # compute strain and stress for pixels 
     solve_strain_stress(ess, ubis, pname, **kwargs)
     
     # select data columns to add to xmap
     alldata = [d for d in dir(ess) if any(['eps' in d, 'sigma' in d])]  # all strain / stress related columns
-    to_keep = [d for d in alldata if ess.__getattribute__(d)[0].shape != (3,3) or d.endswith('eigvecs') ]
+    
+    output_format =  kwargs.get('output_format', None)
+    if not output_format or output_format=='tensor':
+        to_keep  = alldata
+    else:
+        to_keep = [d for d in alldata if ess.__getattribute__(d)[0].shape != (3,3) or d.endswith('eigvecs') ]
     
     for dname in to_keep:
-        data = np.array(ess.__getattribute__(dname))
-        
+        data = np.array(ess.__getattribute__(dname), copy=True)
         dname = dname.replace('eps','strain').replace('sigma','stress')
         
         if isinstance(data[0], (float, int)):
             init_array = np.full(xmap.xyi.shape, np.inf)
-            
-        else: init_array = np.full(xmap.xyi.shape + data[0].shape, np.inf)
+        else:
+            init_array = np.full(xmap.xyi.shape + data[0].shape, np.inf)
         
         if verbose:
             print(f'addding {dname} {init_array.shape} to xmap')
@@ -132,8 +138,11 @@ def xmap_strain_stress_px(xmap, pname, stress_unit='MPa', B0 = None, overwrite_x
         if overwrite_xmap or dname not in xmap.titles():
             xmap.add_data(init_array, dname)
 
-        xmap.update_pixels(xmap.xyi[pxsel], dname, data)
-        
+        xmap.update_pixels(dname, data, selection_mask=pxsel)
+
+        # sanity check: make sure data written in xmap is the same as in EpsSigsolver
+        if not np.allclose(xmap.get(dname)[pxsel], data):
+            raise ValueError(f'{dname}: data in pixelmap dont match with EpsSigSolver')
         
 
 def xmap_strain_stress_grains(xmap, pname, stress_unit='MPa', B0 = None, overwrite_xmap=False, **kwargs):
@@ -160,13 +169,19 @@ def xmap_strain_stress_grains(xmap, pname, stress_unit='MPa', B0 = None, overwri
     
     ess = cs.to_EpsSigSolver()  
     ess.stress_unit=stress_unit
+    print(f'computing strain with d_zero unitcell: {B0}')
     
     # compute strain and stress for selected grains
     solve_strain_stress(ess, ubis, pname, **kwargs)
     
     # select data columns to add to xmap
     alldata = [d for d in dir(ess) if any(['eps' in d, 'sigma' in d])]  # all strain / stress related columns
-    to_keep = [d for d in alldata if ess.__getattribute__(d)[0].shape != (3,3) or d.endswith('eigvecs') ]
+    
+    output_format =  kwargs.get('output_format', None)
+    if not output_format or output_format=='tensor':
+        to_keep  = alldata
+    else:
+        to_keep = [d for d in alldata if ess.__getattribute__(d)[0].shape != (3,3) or d.endswith('eigvecs') ]
     
     for dname in to_keep:
         data = np.array(ess.__getattribute__(dname))
@@ -177,3 +192,6 @@ def xmap_strain_stress_grains(xmap, pname, stress_unit='MPa', B0 = None, overwri
         
         # map grain prop to xmap
         xmap.map_grain_prop(dname, pname)
+
+
+        
