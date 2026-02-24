@@ -12,14 +12,13 @@ _journal_page_first 920
 _journal_page_last 930
 _publ_section_title
 ;
- Structure and elastic properties of quartz at pressure
- P = 1 atm
+ Unit cell fitted to C18A_01 data
 ;
 _database_code_amcsd 0000789
 _chemical_formula_sum 'Si O2'
-_cell_length_a 4.91921
-_cell_length_b 4.91921
-_cell_length_c 5.41186
+_cell_length_a 4.91325
+_cell_length_b 4.91325
+_cell_length_c 5.41206
 _cell_angle_alpha 90
 _cell_angle_beta 90
 _cell_angle_gamma 120
