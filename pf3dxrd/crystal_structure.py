@@ -8,6 +8,7 @@ import Dans_Diffraction as dif
 
 from orix import plot as opl, crystal_map as ocm, vector as ovec
 from ImageD11 import stress
+import ImageD11.unitcell
 
 
 
@@ -54,6 +55,9 @@ class CS:
     
     def copy(self):
         return copy.deepcopy(self)
+
+    def to_ImageD11_unitcell(self):
+        return ImageD11.unitcell.unitcell(self.cell, self.spg_no, name=self.name)
     
     
     class ElasticConstants:
