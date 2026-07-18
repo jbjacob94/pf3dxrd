@@ -8,10 +8,8 @@ import numpy as np, pylab as pl
 import ImageD11.refinegrains, ImageD11.columnfile, ImageD11.parameters
 from pf3dxrd.pf3dxrd import utils, peak_mapping, crystal_structure, pixelmap
 
-
 # Process polyphasic scanning-3dxrd datasets. Map phases on a 2D pixel grid, finding the best match for each pixel among a pre-defined list of candidates
 # provided  as CIF files. Details in Jacob et al. (2024): 'Exploiting Friedel pairs to interpret scanning 3DXRD data from complex geological materials'
-
 
 #======================================================================
 #                      MAIN CLASS INTERFACE
@@ -86,12 +84,12 @@ class PhaseMapper:
     
     def check_peakfile(self):
         """ 
-        make sure peakfile if ok: contains (xs,ys) + (xi,yi,xyi) columns. Also add rescaled intensity (Lorentz factor)
+        make sure peakfile if ok: contains (sx,sy) + (xi,yi,xyi) columns. Also add rescaled intensity (Lorentz factor)
         """
         
         cf = self.peakfile
         
-        assert all(['xs' in cf.titles, 'ys' in cf.titles]), 'peakfile has no coordinates in sample space. Please run friedel_pairs.update_geometry_fpairs'
+        assert all(['sx' in cf.titles, 'sy' in cf.titles]), 'peakfile has no coordinates in sample space. Please run friedel_pairs.update_geometry_fpairs'
         
         if 'xyi' not in self.peakfile.titles:
             print('no xyi column in peakfile. Adding pixel index...')
@@ -222,14 +220,14 @@ class PhaseMapper:
         assert hasattr(cs, 'strong_peaks'), 'No Bragg peaks found for this phase. Please run self.compute_phase_mask'
         
         # check peakfile is sorted by tth (required for select_tth_rings)
-        #mask = utils.select_tth_rings_fast(self.peakfile, cs.strong_peaks[0], tthcol='tth', tth_tol=tth_tol, tth_max=tth_max)
-        mask = utils.select_tth_rings(self.peakfile, cs.strong_peaks[0], tth_tol, tth_max)
+        mask = utils.select_tth_rings_fast(self.peakfile, cs.strong_peaks[0], tthcol='tth', tth_tol=tth_tol, tth_max=tth_max)
+        #mask = utils.select_tth_rings(self.peakfile, cs.strong_peaks[0], tth_tol, tth_max)
         pks_frac = np.count_nonzero(mask) / self.npks
         
         print(f'pks fraction {cs.name}: {pks_frac:.4f}')  # prop of peaks assigned to this phase
         self.peakfile.addcolumn(mask, pname)
         self.stats_phase_masks[pname] = pks_frac
-        self.sortkey = 'tth'  # reset sortkey
+        #self.sortkey = 'tth'  # reset sortkey
         
     
     def compute_mask_overlaps(self):
@@ -269,7 +267,7 @@ class PhaseMapper:
         - phase masks have been computed
 
         INITIALIZATION:
-        - initialize phase_id column
+        - initialize phase_ids column
         - sort peakfile by xyi and convert peakfile.xyi to int (faster index search)
         - create list of unique xyi indexes to search through
         """
@@ -290,7 +288,7 @@ class PhaseMapper:
             self.peakfile.sortby('xyi')
             self.sortkey = 'xyi'
         self.peakfile.xyi = self.peakfile.xyi.astype(int)  # convert to int type for faster search with np.searchsorted
-        self.peakfile.addcolumn(np.full(self.npks, -1), 'phase_id')
+        self.peakfile.addcolumn(np.full(self.npks, -1), 'phase_ids')
         self.xyi_uniq = np.unique(self.peakfile.xyi)
         np.seterr(divide = 'ignore', invalid = 'ignore')
 
@@ -349,14 +347,17 @@ class PhaseMapper:
     
         # initialize new data columns
         xmap = self.pixelmap
-        xmap.add_data(np.full(xmap.xyi.shape, 0, dtype=np.uint16), 'Npks')
-        xmap.add_data(np.full(xmap.xyi.shape, 0, dtype=np.float64), 'phase_label_confidence')
-        xmap.add_data(np.full(xmap.xyi.shape, 0, dtype=np.float64), 'completeness')
-        xmap.add_data(np.full(xmap.xyi.shape, 0, dtype=np.float64), 'uniqueness')
-        xmap.phase_id = np.full(xmap.xyi.shape, -1)
+        lx = xmap.xyi.shape
+        dnames = 'phase_ids Npks phase_map_completeness phase_map_uniqueness phase_label_confidence'.split(' ')
+        dshapes = [lx, lx, lx, lx, lx]
+        initvals = [-1, 0, 0, 0, 0]
+        dtypes = [np.int16, np.float64, np.float64, np.float64, np.float64]
+        for n,shp,ival,dt in zip(dnames, dshapes, initvals, dtypes):
+            ary = np.full(shp, ival, dt)               
+            xmap.add_data(ary,n)
 
         # update xmap with results
-        for i,col in enumerate(['phase_id','completeness', 'uniqueness', 'phase_label_confidence']):
+        for i,col in enumerate(['phase_ids','phase_map_completeness', 'phase_map_uniqueness', 'phase_label_confidence']):
             dat = np.array([self.res[px][i] for px in self.xyi_uniq])
             xmap.update_pixels(col, dat, self.xyi_uniq)
             
@@ -364,12 +365,12 @@ class PhaseMapper:
         xmap.update_pixels('Npks', npks, self.xyi_uniq)
         
         # loop through results, update xmap and phase label in peakfile
-        self.peakfile.phase_id = np.full(self.peakfile.nrows, -1)
+        self.peakfile.phase_ids = np.full(self.peakfile.nrows, -1)
         for i,px in enumerate(tqdm(self.xyi_uniq)):
             if npks[i] == 0:
                 continue
             pks = self.res[px][4]
-            self.peakfile.phase_id[pks] = self.res[px][0]
+            self.peakfile.phase_ids[pks] = self.res[px][0]
     
         print(xmap) 
     
@@ -407,10 +408,10 @@ class PhaseMapper:
         print('fraction of labeled peaks \n----------') 
         for t in titles:
             if t == 'assigned':
-                m = self.peakfile.phase_id != -1
+                m = self.peakfile.phase_ids != -1
             else:
                 pid = self.phases.pids[self.phases.pnames.index(t)]
-                m = self.peakfile.phase_id == pid
+                m = self.peakfile.phase_ids == pid
 
             pks_frac = np.count_nonzero(m) / self.npks
             print(f'{t}: {pks_frac:.4f}')  # prop of peaks assigned to this phase
@@ -422,10 +423,10 @@ class PhaseMapper:
         sumItot = np.sum(self.peakfile.norm_intensity)
         for t in titles:
             if t == 'assigned':
-                m = self.peakfile.phase_id != -1
+                m = self.peakfile.phase_ids != -1
             else:
                 pid = self.phases.pids[self.phases.pnames.index(t)]
-                m = self.peakfile.phase_id == pid
+                m = self.peakfile.phase_ids == pid
                 
             Ints_frac = np.sum(self.peakfile.norm_intensity[m]) / sumItot
             print(f'{t}: {Ints_frac:.4f}')  # prop of peaks assigned to this phase
@@ -475,7 +476,6 @@ class PhaseMapper:
         pl.xlim(min_tth, max_tth)
         
         
-        
     def plot_tth_eta(self, min_tth=0, max_tth=25,
                             show_theorytth = True,
                             phase_colors = None):
@@ -489,54 +489,49 @@ class PhaseMapper:
         show_theorytth   : if True, add ticks marking the position of computed Bragg peaks for each phase
         phase_colors     : use a mask to color each peak by phase. 
                            - 'from_phase_mask': pre-computed phase mask (in self.peakfile.phase_name) is used
-                           - 'from_phase_id'  : final phase_id (obtaind from pixel-by-pixel phase mapping is used
+                           - 'from_phase_ids'  : final phase_ids (obtaind from pixel-by-pixel phase mapping is used
                            - None : single color for all peaks
-        """ 
-        
-        
+        """         
         # sort peakfile by tth
-        if self.sortkey != 'tth':
-            self.peakfile.sortby('tth')
-            self.sortkey = 'tth'
+        #if self.sortkey != 'tth':
+        #    self.peakfile.sortby('tth')
+        #    self.sortkey = 'tth'
          
         # limit number of peaks to plot to 1e6; Useful for large peakfiles
-        p = min(1e6/self.peakfile.nrows,1)
+        p = min(5e5/self.peakfile.nrows,1)
         m = np.random.choice([True, False], self.peakfile.nrows, p = [p, 1-p])
-        m2 = np.all([self.peakfile.tth <= max_tth, self.peakfile.tth >= min_tth], axis=0)
         
         # plot
         fig = pl.figure(figsize=(10,5))    
         pl.xlim(min_tth, max_tth)
-        pl.plot(self.peakfile.tth[m*m2], self.peakfile.eta[m*m2], ',', label = 'all peaks')
+        pl.plot(self.peakfile.tth[m], self.peakfile.eta[m], ',', label = 'all peaks')
         
         colors = pl.matplotlib.cm.tab10.colors
         
         for i, pname in enumerate(self.phases.pnames):
-            if phase_colors not in ['from_mask','from_phase_id']:
+            if phase_colors not in ['from_mask','from_phase_ids']:
                 continue
             cs = self.phases.get(pname)
             color = colors[i+2]
             
             if phase_colors == 'from_mask':
                 pm = self.peakfile.getcolumn(pname)
-            elif phase_colors == 'from_phase_id':
-                pm = self.peakfile.phase_id == cs.phase_id
+            elif phase_colors == 'from_phase_ids':
+                pm = self.peakfile.phase_ids == cs.phase_id
             
-            pl.plot(self.peakfile.tth[m*m2*pm], self.peakfile.eta[m*m2*pm], ',', color = color)
-            
+            pl.plot(self.peakfile.tth[m*pm], self.peakfile.eta[m*pm], ',', color = color)
             
         # add theoretical Bragg peaks from stored phases
         if show_theorytth:
             for i, pname in enumerate(self.phases.pnames):
                 cs = self.phases.get(pname)
                 pl.vlines(cs.strong_peaks[0], -100,100, colors = colors[i+2], label=cs.name)
-                
+        
         pl.legend(loc='upper left')
+        pl.xlim(min_tth, max_tth)
         pl.xlabel('2-theta deg')
         pl.ylabel('eta deg')
-                
-
-        
+                   
 # MULTIPROCESSING BACKEND
 # --- Global variables for worker processes ---
 _GLOBALS = {}
@@ -564,14 +559,14 @@ def _best_phase_match_worker(px):
         
     Returns:
     --------
-    list : [phase_id, completeness, uniqueness, confidence_score, peaks_index]
+    list : [phase_ids, completeness, uniqueness, confidence_score, peaks_index]
     
-    phase_id     : Integer label for the best phase, as in phases.pids. default = -1
+    phase_ids     : Integer label for the best phase, as in phases.pids. default = -1
     completeness : Fraction of total intensity matched by the best phase on pixel px. default = 0
     uniqueness   : Fraction of intensity uniquely matched by the best phase (ie. no match found with any other
                     phase for this subset). default = 0
     confidence   : normalized confidence index. product of completeness x uniqueness normalized to the number of phases.
-    peaks_index  : array of peak indexes corresponding to the phase assigned on pixel px. needed to update phase_id column in peakfile
+    peaks_index  : array of peak indexes corresponding to the phase assigned on pixel px. needed to update phase_ids column in peakfile
     """
     t0 = time.perf_counter()
     cf = _GLOBALS["peakfile"]
@@ -633,8 +628,6 @@ def _best_phase_match_worker(px):
     pksinds = s_px[pks.astype(bool)]
     
     return pid, c_best, u_best, conf_ind_best, pksinds
-
-
 
 def _func_wrapper(px):
     """ small wrapper to return px and output """

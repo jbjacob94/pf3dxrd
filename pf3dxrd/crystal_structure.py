@@ -289,7 +289,7 @@ def load_CS_from_cif(cif_path, name='', pid = -1):
     cif_path (str) : path to cif file
     name (str)     : phase name
     pid (int)      : phase id. integer label unique to the phase 
-                     (useful for defining phase_id in pixelmap and ImageD11.columnfile)
+                     (useful for defining phase_ids in pixelmap and ImageD11.columnfile)
     
     """
     cs = CS(name, pid, cif_path)

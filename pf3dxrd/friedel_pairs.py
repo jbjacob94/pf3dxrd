@@ -1,4 +1,7 @@
-""" This module contains functions to identify symmetric (h,k,l), (-h,-k,-l) reflections (aka. Friedel pairs) in a 3DXRD dataset. It works the best with scanning-3DXRD data acquired using a pencil-beam scanning procedure, but seems to provide also good results with regular 3DXRD scans using a box beam or a letter-box beam. 
+"""
+DEPRECATED; Use ImageD11.friedel_pairs.py instead
+
+This module contains functions to identify symmetric (h,k,l), (-h,-k,-l) reflections (aka. Friedel pairs) in a 3DXRD dataset. It works the best with scanning-3DXRD data acquired using a pencil-beam scanning procedure, but seems to provide also good results with regular 3DXRD scans using a box beam or a letter-box beam. 
 
 For more details, see related publication [add it when published]
 """
@@ -219,47 +222,6 @@ I don'
     logtth = mtth * np.log(np.tan(np.radians(cf.tth[mask])))   
     
     return eta_n, omega_n, logI, logtth
-    
-
-        
-def search_space_normalized(cf, mask, flip_eta_omega=False):
-    """
-    Same as searchspace function above but coordinates are normalized to [0,1]. NOT RECOMMENDED!! (see note below)
-    
-    eta_n   = (eta/360) mod 1
-    omega_n = (omega/360) mod 1
-    I_n     = (log(I) - log(I).min) / (log(I).max - log(I).min)
-    tth_n   = (ln(tan_tth) - ln(tan_tth).min / (ln(tan_tth).min - ln(tan_tth).max)    where tan_tth = tan(tth)
-    
-    Args:
-    ----------
-    cf   : input columnfile
-    mask : boolean mask of len cf.nrows to select a subset in cf
-    flip_eta_omega (Bool).  If True, eta and omega coordinate are flipped
-    
-    See also: search_space
-    
-    Note: Using the normalized search space yields weird results. I suspect it gives too much importance to tth and Intensity.
-    Hence, unrealistic pair matchs are found between peaks very far from each other (>>1°) in eta and omega. 
-    """
-    if mask is None:
-        mask = np.full(cf.nrows, True)
-    
-    # eta - omega
-    if flip_eta_omega:
-        eta_n = ((180 - cf.eta[mask])/360) % 1
-        omega_n = ((180+cf.omega[mask])/360) % 1
-    else:
-        eta_n = (cf.eta[mask]/360) % 1
-        omega_n = (cf.omega[mask]/360) % 1
-    # sum_intensity
-    logI = np.log10(cf.sum_intensity[mask])
-    I_n = (logI - logI.min()) / (logI.max() - logI.min())
-    # two-theta
-    logtth = np.log(np.tan(np.radians(cf.tth[mask])))
-    tth_n = (logtth - logtth.min()) / (logtth.max() - logtth.min())
-    
-    return eta_n, omega_n, tth_n, I_n
 
 
 
@@ -444,7 +406,6 @@ def label_friedel_pairs(c1, c2, dist_max=1., dist_step=0.1, mtth = 5, mI=1/5, ve
             newlabels = np.arange(max(fp_labels)+1, max(fp_labels)+len(c1_indx)+1)
         
         fp_labels.extend(newlabels)
-        
         
         # sanity check. make sure we are not overwriting already indexed pairs
         assert np.all([i == -1 for i in c1.fp_id[c1_indx]])

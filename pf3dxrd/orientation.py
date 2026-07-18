@@ -14,7 +14,7 @@ import ImageD11.refinegrains
 import ImageD11.unitcell
 import xfab
 from orix import data, io, plot as opl, quaternion as oq, vector as ovec
-from pf3dxrd.pf3dxrd import utils, crystal_structure, peak_mapping
+from pf3dxrd.pf3dxrd import utils, crystal_structure
 
 
 
@@ -38,7 +38,7 @@ def segment_grains(xmap, pname, Ucol='U', threshold_deg=10, min_grain_size=3):
     min_grain_size (int) : Minimum grain size in pixels. Grains smaller than this are reset as unlabeled
 
     Returns:
-    grain_id (ndarray) : labeled grain map
+    grain_ids (ndarray) : labeled grain map
     gb_mask  (bool array) : grain boundary mask
     mis_max (ndarray) : max misorientation (between x and y misorientation) map
     """
@@ -71,26 +71,26 @@ def segment_grains(xmap, pname, Ucol='U', threshold_deg=10, min_grain_size=3):
     gb_mask = mis_max >= threshold_deg 
     
     # Label connected components
-    grain_id, n_grains = ndi.label(same_grain_mask)  # 4-connectivity
-    uniq_labels, npix = np.unique(grain_id.flatten(), return_counts=True)
+    grain_ids, n_grains = ndi.label(same_grain_mask)  # 4-connectivity
+    uniq_labels, npix = np.unique(grain_ids.flatten(), return_counts=True)
     grain_sizes = {gid: n for gid, n in zip(uniq_labels,npix) if gid != 0}
 
     # Remove small grains if requested
     if min_grain_size > 0:
         small_ids = [gid for gid, n in grain_sizes.items() if n < min_grain_size]
         if small_ids:
-            mask_small = np.isin(grain_id, small_ids)
+            mask_small = np.isin(grain_ids, small_ids)
             same_grain_mask[mask_small] = False
             gb_mask[mask_small] = True
             # recompute connected domains after removal to relabel properly
-            grain_id, n_grains = ndi.label(same_grain_mask)
-            uniq_labels, npix = np.unique(grain_id.flatten(), return_counts=True)
+            grain_ids, n_grains = ndi.label(same_grain_mask)
+            uniq_labels, npix = np.unique(grain_ids.flatten(), return_counts=True)
             grain_sizes = {gid: n for gid, n in zip(uniq_labels,npix) if gid != 0}
 
     n_grain = grain_sizes.keys()
     print(f"Identified {n_grains} grains for phase '{pname}'")
 
-    return grain_id, gb_mask, mis_max
+    return grain_ids, gb_mask, mis_max
 
 
 

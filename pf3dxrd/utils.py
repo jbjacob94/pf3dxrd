@@ -33,9 +33,9 @@ def colf_to_hdf( colfile, hdffile, save_mode='minimal', name=None, compression='
         """  
         # LIST OF COLUMNS TO SAVE AS INTEGERS / FLOATS. UPDATED FROM IMAGED11
         INTS   = columnfile.INTS + ['xyi']              # store as np.int32 : max ~ 2.14e9
-        LONGINTS = ['fp_id']                            # store as np.int64 : max ~ 9.22e18
-        SHORTINTS = ['h','k','l','xi','yi','phase_id', 'grain_id']  # store as np.int16 : max = 32768
-        FLOATS = columnfile.FLOATS + ['xs', 'ys', 'fp_dist', 'r_dist', 'norm_intensity'] # store as np.float32
+        LONGINTS = ['fp_id', 'omega_pair_id', 'eta_pair_id']        # store as np.int64 : max ~ 9.22e18
+        SHORTINTS = ['h','k','l','xi','yi','phase_ids', 'grain_ids']  # store as np.int16 : max = 32768
+        FLOATS = columnfile.FLOATS + ['sx', 'sy', 'fp_dist', 'r_dist', 'norm_intensity'] # store as np.float64
     
     
         if isinstance(colfile, columnfile.columnfile):
@@ -59,7 +59,7 @@ def colf_to_hdf( colfile, hdffile, save_mode='minimal', name=None, compression='
         g.attrs['ImageD11_type'] = 'peaks'
         
         # col to exclude in "minimal" saving mode (can be recomputed with info from other columns, but takes a bit longer) 
-        exclude = ['xl', 'yl', 'zl', 'tth', 'tthc', 'eta', 'gx', 'gy', 'gz', 'ds', 'dsc', 'xs', 'ys', 'r_dist', 'xi', 'yi']
+        exclude = ['xl', 'yl', 'zl', 'tth', 'tthc', 'eta', 'gx', 'gy', 'gz', 'ds', 'dsc', 'sx', 'sy', 'r_dist', 'xi', 'yi']
         if save_mode == 'minimal':
             cols = [col for col in c.titles if col not in exclude]
         else:
@@ -115,7 +115,6 @@ def correct_distorsion_eiger( cf, parfile,
     return cf
 
 
-
 def correct_disorsion_frelon( cf, parfile, splinefile, detector_dim = [2048,2048]):
     """ 
     FOR FRELON DATA. Apply detector distortion correction using a pixel look up table computed from a splinefile. 
@@ -156,7 +155,6 @@ def correct_disorsion_frelon( cf, parfile, splinefile, detector_dim = [2048,2048
     return cf
 
 
-
 def fix_flt( cf, splinefile, parfile ):
     """ 
     spline correction for ImageD11 columnfile with standard method. Slow...
@@ -179,28 +177,20 @@ def fix_flt( cf, splinefile, parfile ):
     cf.updateGeometry()
 
 
-
-    
 # unit cell parameters, hkl rings etc.
 ########################################################################################
-
 def get_uc(cf):
     """ computes unitcell and hkl rings using parameters in cf.parameters """ 
     wl = cf.parameters.get('wavelength')
     spg = cf.parameters.get('cell_sg')
-
     # compute unit cell
     uc = unitcell.unitcell_from_parameters(cf.parameters)
     uc.makerings(cf.ds.max())
-    
     ds = uc.ringds
     hkls = uc.ringhkls
     ds = np.unique(ds)
-
     tth_calc = [np.arcsin( wl*d/2 )*360/np.pi for d in ds]
-    
     return uc, ds, hkls, tth_calc, wl
-
 
 def gethkl(cell,spg, sym, wl, dsmax=1.):
     """ return unique ds + hkl rings for a given space group + wavelength """
@@ -209,7 +199,6 @@ def gethkl(cell,spg, sym, wl, dsmax=1.):
     d = [hkls[i][0] for i in range(len(hkls))]
     d = np.unique(d)
     return d, hkls
-
 
 def update_colf_cell(cf, cell, spg, lattice_type, mute=False):
     """ update cf.parameters with new cell parameters and crystal symmetry (a, b, c, alpha, beta, gamma, sg, lattice) """
@@ -222,17 +211,13 @@ def update_colf_cell(cf, cell, spg, lattice_type, mute=False):
     if not mute:
         print('updated colfile parameters')
         
-
 def get_Xray_energy(wl):
     """ return x-ray energy (kev) from wavelength """
     E_kev = 6.62607015e-34*2.99792e8/(wl*1e-10) / 1.60218e-19 / 1e3
     return E_kev
 
-
-
 # Operations on columnfiles: drop column, merge two columnfiles, get columnfile size, etc.
 ########################################################################################
-
 def merge_peakfiles(cf_list):
     """ Merge a series of peakfile containing the same columns"""
     titles_all = [cf.titles for cf in cf_list]
@@ -242,7 +227,6 @@ def merge_peakfiles(cf_list):
     cf_merged = columnfile.colfile_from_dict(big_cf_dict)
     return cf_merged
     
-            
 def dropcolumn(cf, colname):
     """ remove column from colfile """
     assert colname in cf.titles
@@ -253,7 +237,6 @@ def dropcolumn(cf, colname):
     del cf
     return c_out
 
-
 def get_colf_size(cf, disp=True):
     """ returns memory taken by the columnfile when loaded"""
     size_MB = sum([sys.getsizeof(cf[item]) for item in cf.keys()]) / (1024**2)
@@ -261,12 +244,10 @@ def get_colf_size(cf, disp=True):
         print('Total size = ', '%.2f' %size_MB, 'MB')
     else:
         return size_MB
-
     
 def select_subset(cf, rowinds=None, cols=None):
     """
     select subset from peakfile cf. keeps only columns in cols and row indices in inds
-    
     Args:
     ---------
     cf      : peakfile
@@ -274,7 +255,6 @@ def select_subset(cf, rowinds=None, cols=None):
              by default, keep all rows
     cols    : list. naes of columns to keep. By default, keep all columns
     """
-
     pars = cf.parameters
     if cols is None:
         cols = cf.titles
@@ -294,20 +274,15 @@ def select_subset(cf, rowinds=None, cols=None):
     
     cf_sub = columnfile.colfile_from_dict({t:cf.getcolumn(t)[rowinds] for t in cols})
     cf_sub.setparameters(pars)
-
     # Run garbage collection
     gc.collect()  
-    
     return cf_sub    
 
-
-    
 def select_subset_area(cf, selection_type = 'rectangle',
                   xmin=0, ymin=0, xmax=1, ymax=1,
                   xcenter=0, ycenter=0, r=1):
     """
-    select subset of peaks based on (xs,ys) position in the sample. Peakfile must contain (xs,ys) coordinates
-    
+    select subset of peaks based on (sx,sy) position in the sample. Peakfile must contain (sx,sy) coordinates
     Args:
     --------
     cf : columnfile
@@ -323,10 +298,9 @@ def select_subset_area(cf, selection_type = 'rectangle',
     
     if selection_type == 'rectangle':
         assert all([xmin < xmax, ymin < ymax])
-        mask = np.all([cf.xs <= xmax, cf.xs >= xmin, cf.ys <= ymax, cf.ys >= ymin], axis=0)
-        
+        mask = np.all([cf.sx <= xmax, cf.sx >= xmin, cf.sy <= ymax, cf.sy >= ymin], axis=0) 
     else:
-        mask = (cf.xs - xcenter)**2 + (cf.ys - ycenter)**2 <= r**2
+        mask = (cf.sx - xcenter)**2 + (cf.sy - ycenter)**2 <= r**2
 
     return mask
 
@@ -355,7 +329,6 @@ def select_tth_rings(cf, tth_calc, tth_tol, tth_max=20, is_sorted=False):
     ----------
     mhkl : peak selection as a Boolean mask
     """
-    
     # use tth or tthc. Arrays need to be sorted on tth/tthc for indices selection
     if 'tthc' in cf.titles:
         if not is_sorted or cf.sortedby != 'tth':
@@ -388,7 +361,6 @@ def select_tth_rings(cf, tth_calc, tth_tol, tth_max=20, is_sorted=False):
 def select_tth_rings_fast(cf, tth_calc, tthcol='tth', tth_tol=0.02, tth_max=20):
     """ select all peaks within tth_tol distance from a list of hkl rings. useful to select a specific phase from computed hkl rings positions.
     
-    
     Args:
     ----------
     cf: columnfile
@@ -417,10 +389,10 @@ def select_tth_rings_fast(cf, tth_calc, tthcol='tth', tth_tol=0.02, tth_max=20):
     tth_max = min(tth_max, max(tth))
     # scan each tth ring and select peaks
     
-    for hkl in tth_calc:
-        if hkl >= tth_max:
+    for tth0 in sorted(tth_calc):
+        if tth0 >= tth_max:
             break
-        imin, imax = np.searchsorted(tth_sorted, hkl - tth_tol), np.searchsorted( tth_sorted, hkl + tth_tol)
+        imin, imax = np.searchsorted(tth_sorted, tth0 - tth_tol), np.searchsorted( tth_sorted, tth0 + tth_tol)
         inds.extend(np.r_[imin:imax])
     inds = np.asarray(inds)
 
@@ -432,7 +404,6 @@ def select_tth_rings_fast(cf, tth_calc, tthcol='tth', tth_tol=0.02, tth_max=20):
     mhkl = mhkl_ordered[inv_order]
 
     return mhkl
-
 
 
 def compute_tth_histogram(cf, tthcol='tth', tthmin=0, tthmax=20, tthstep = 0.001, mask=None,
@@ -477,17 +448,12 @@ def compute_tth_histogram(cf, tthcol='tth', tthmin=0, tthmax=20, tthstep = 0.001
         fig = pl.figure(figsize=(10,5))
         pl.plot(bincens, hist, **kwargs)
         pl.xlabel('two-thet deg')
-        
-               
+             
     return hist, bincens, binedges
-
-
 
 
 def split_xy_chunks(cf,ds, nx, ny, doplot=True):
     """ Split peakfile into rectangular chunks using (xs,ys) coordinates in sample reference frame. 
-    
-    
     Args:
     ----------
     cf : columnfile
@@ -627,8 +593,8 @@ def friedel_recon(cf, xbins, ybins, doplot=True, mask=None, weight_by_intensity=
     else:
         weights = np.ones(cf.sum_intensity[mask].shape)
         
-    r = fast_histogram.histogram2d( cf.xs[mask], 
-                                      cf.ys[mask],
+    r = fast_histogram.histogram2d(   cf.sx[mask], 
+                                      cf.sy[mask],
                                       weights = weights,   # gives more weight to peaks with high intensity
                                       range = [[xbins[0], xbins[-1]],
                                                [ybins[0], ybins[-1]]],

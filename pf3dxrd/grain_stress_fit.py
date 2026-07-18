@@ -100,7 +100,7 @@ def xmap_strain_stress_px(xmap, pname, stress_unit='MPa', B0 = None, overwrite_x
     """
     # initialize strain stress solver
     cs = xmap.phases.get(pname).copy()
-    pxsel = xmap.phase_id == cs.phase_id
+    pxsel = xmap.get_phase_mask(pname)
     ubis = xmap.UBI[pxsel]
     
     if B0 is not None:

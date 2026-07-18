@@ -1,4 +1,5 @@
 """
+DEPRECATED: use match_friedel_pairs.py in ImageD11
 Run Friedel pair search for all scans in a peakfile. Make the code parallel over each pair of scans (dty,-dty) to match
 """
 
@@ -274,6 +275,20 @@ def correct_distortion_frelon( cf, parfile, splinefile):
     
     return cf
 
+def _distortion_correction(cf, ds, parfile, splinefile=None, dxfile=None, dyfile=None):
+    print('\n====================\nDetector distortion correction...')
+    if 'frelon' in ds.detector:
+        cf = correct_distortion_frelon( cf, parfile, splinefile)
+
+    elif 'eiger' in ds.detector:
+        if (dxfile is None) or (dyfile is None):
+            cf = correct_distortion_eiger(cf, parfile)
+        else:            
+            cf = correct_distortion_eiger(cf, parfile, dxfile = dxfile, dyfile=dyfile)
+    else:
+        raise NameError('detector type not recognized')
+
+    
 # Parallelization stuff
 #####################################################################
 _shared_cf = None
@@ -348,18 +363,12 @@ def main():
     # load peaktable, export to colfile, correct distortion
     #################################################################
     cf, ds = load_data(args.pksfile, args.dsfile, args.parfile, args.use2Dpeaks)
-    
-    print('\n====================\nDetector distortion correction...')
-    if 'frelon' in ds.detector:
-        cf = correct_distortion_frelon( cf, args.parfile, args.splinefile)
 
-    elif 'eiger' in ds.detector:
-        if (args.dxfile is None) or (args.dyfile is None):
-             cf = correct_distortion_eiger(cf, args.parfile)
-        else:            
-            cf = correct_distortion_eiger(cf, args.parfile, dxfile = args.dxfile, dyfile=args.dyfile)
+    if 'sc' not in cf.titles:
+        _distortion_correction(cf, ds, args.parfile, args.splinefile, args.dxfile, args.dyfile)
     else:
-        raise NameError('detector type not recognized')
+        cf.parameters.loadparameters(args.parfile)
+        cf.updateGeometry()
     
     # folder for saving output: same as folder containing the pksfile
     savedir = os.path.dirname(args.pksfile) 
@@ -479,9 +488,9 @@ parser = argparse.ArgumentParser(description='Friedel pairs matching')
 parser.add_argument('-pksfile', help='absolute path to peakfile/peaks_table', required=True)
 parser.add_argument('-dsfile', help='absolute path to datset file', required=True)
 parser.add_argument('-parfile', help='absolute path to parameters file', required=True)
-parser.add_argument('-splinefile', help='spline file for detector distortion correction (frelon)', required=False)
-parser.add_argument('-dxfile', help='dx file for detectrot distortion correction (eiger)', required=False)
-parser.add_argument('-dyfile', help='dy file for detectrot distortion correction (eiger)', required=False)
+parser.add_argument('-splinefile', default=None, help='spline file for detector distortion correction (frelon)', required=False)
+parser.add_argument('-dxfile', default=None, help='dx file for detector distortion correction (eiger)', required=False)
+parser.add_argument('-dyfile', default=None, help='dy file for detector distortion correction (eiger)', required=False)
 parser.add_argument('-pairing_options', help='pairing options saved in json file (optional)', required=False)
 parser.add_argument('-use2Dpeaks', default=False, help='If loading from a peak table, do not merge peaks in omega but use raw 2D peaks', required=False)   
   
