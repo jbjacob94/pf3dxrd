@@ -103,7 +103,7 @@ class Options:
     """
  
     # attributes that are non-serialisable and/or recomputed on load
-    _SKIP = frozenset(['sym', 'flipmats', 'unitcell', 'ncpu'])
+    _SKIP = frozenset(['sym', 'unitcell', 'flipmats', 'ncpu'])
  
     def __init__(self):
         # ---- Default numeric and logic parameters ----
@@ -112,6 +112,7 @@ class Options:
         self.useIntensity   = False     # include intensity score for matching best ubi (refinement stage)
         self.minpks         = 10        # minimum number of g-vectors to consider a ubi as a possible match
         self.maxpks         = 5000      # cutoff value for peaks number in 1st-round indexing
+        self.frac_strong    = 0.9       # cumulative intensity fraction of strong peaks selection for indexing (1st stage) 
         self.minpks_prop    = 0.1       # min fraction of g-vectors over pixel to consider a ubi match
         self.nrings         = 10        # max number of hkl rings to search
         self.max_mult       = 12        # max multiplicity of hkl rings to search
@@ -125,17 +126,16 @@ class Options:
         # ---- Derived or system-dependent parameters ----
         self.unitcell = None
         self.sym = getattr(ImageD11.sym_u, self.symmetry)()
-        self.flipmats = self.sym.group
+        self.flipmats = None
         self.ncpu = len(os.sched_getaffinity(os.getpid())) - 1  # use all but one CPU by default
  
         # ---- slurm / cluster options ----
         self.slurm_partition = 'nice'
         self.slurm_mem_G     = 64
         self.slurm_time      = '04:00:00'
-        self.slurm_cpus      = 16        # should roughly match ncpu + 1
- 
-    # ----- save/load methods (for Jupyter <-> batch sync) -----
- 
+        self.slurm_cpus      = 16       
+
+
     def to_dict(self):
         """Convert current options to a plain dict."""
         d = {}
@@ -148,29 +148,44 @@ class Options:
             except (TypeError, ValueError):
                 print('Warning: skipping non-serialisable attribute '
                       '"{}" ({})'.format(k, type(v).__name__))
+        # flipmats: convert ndarrays -> nested lists for JSON, if set
+        if self.flipmats is not None:
+            d['flipmats'] = [np.asarray(m).tolist() for m in self.flipmats]
         return d
- 
+
     def save(self, path="indexing_pars.json"):
         """Save current options to a JSON file."""
         with open(path, "w") as f:
             json.dump(self.to_dict(), f, indent=4)
         print("[SAVED] Options saved to {}".format(path))
- 
+
     @classmethod
     def load(cls, path="indexing_options.json"):
         """Load options from a JSON file."""
         with open(path, "r") as f:
             data = json.load(f)
+
+        # pull flipmats out before the generic setattr loop
+        flipmats_data = data.pop('flipmats', None)
+        
         obj = cls()
         for k, v in data.items():
             setattr(obj, k, v)
+            
         # reinitialize symmetry-dependent / system-dependent fields
-        obj.sym      = getattr(ImageD11.sym_u, obj.symmetry)()
-        obj.flipmats = obj.sym.group
-        obj.ncpu     = len(os.sched_getaffinity(os.getpid())) - 1
+        obj.sym  = getattr(ImageD11.sym_u, obj.symmetry)()
+        obj.ncpu = len(os.sched_getaffinity(os.getpid())) - 1
+        
+        # flipmats: convert nested lists -> ndarrays, if present
+        if flipmats_data is not None:
+            obj.flipmats = [np.asarray(m, dtype=float) for m in flipmats_data]
+        else:
+            obj.flipmats = None
+        
         print("[LOADED] Options loaded from {}".format(path))
         return obj
- 
+
+        
     def __repr__(self):
         params = ", ".join("{}={}".format(k, v) for k, v in self.__dict__.items() if not callable(v))
         return "<Options {}>".format(params)
@@ -276,6 +291,9 @@ def prepare_bash_script(pksfile, xmapfile, dsfile, parfile, pname,
         '#SBATCH --output={sdir}/{dsname}_{pname}_%j.out\n'
         '#SBATCH --error={sdir}/{dsname}_{pname}_%j.err\n'
         '\n'
+        '# --- environment setup ---\n'
+        'export NUMBA_CPU_NAME=generic\n'
+        'export NUMBA_CPU_FEATURES=""\n'
         '# ── job info ─────────────────────────────────────────────────\n'
         'echo "------------------------------------------------------------"\n'
         'echo "Job ID    : $SLURM_JOB_ID"\n'
@@ -594,6 +612,7 @@ def pixel_ubi_fit(args, loginfo=False):
     useInts     = OPTS.useIntensity  # include intensity score (correlation with predicted peaks) for matching best ubi (refinement stage)
     minpks      = OPTS.minpks        # minimum number of g-vectors to consider a ubi as a possible match (see ImageD11.indexing)
     maxpks      = OPTS.maxpks        # max nb of g-vectors to keep for first stage indexing. Refinement is then done using all peaks
+    frac_strong = OPTS.frac_strong   # cumulative intensity fraction of strong peaks selection for indexing (1st stage) 
     minpks_prop = OPTS.minpks_prop   # minimum fraction of g-vectors over the selected pixel to consider a ubi as a possible match.
     max_mult    = OPTS.max_mult      # maximum multplicity of hkl rings in which possible orientation match will be searched. 
     nrings      = OPTS.nrings        # maximum number of hkl rings to search in 
@@ -612,7 +631,7 @@ def pixel_ubi_fit(args, loginfo=False):
     # subset gv for first indexing: take the N-strongest gvecs only (reduces computation time). 
     #p = min(maxpks/len(s),1) * 100
     #cut = to_index.norm_intensity[s] >= np.percentile(to_index.norm_intensity[s],100-p)
-    cut = _strong_peaks(to_index.norm_intensity[s], frac=0.9, min_peaks=minpks, max_peaks=maxpks)
+    cut = _strong_peaks(to_index.norm_intensity[s], frac=frac_strong, min_peaks=minpks, max_peaks=maxpks)
     
     # prepare indexer
     ###########################################################################
@@ -674,7 +693,7 @@ def pixel_ubi_fit(args, loginfo=False):
         return default_output
  
     if loginfo:
-        print(f'UBI guesses:\n')
+        print(f'{len(ind.ubis)} UBI guesses:\n')
         for ubi in ind.ubis:
             print(f'{ubi}\n')
     
@@ -701,6 +720,10 @@ def pixel_ubi_fit(args, loginfo=False):
             for j, group_rot in enumerate(OPTS.flipmats):
                 ubi_rot = group_rot.dot(ubi_uniq)
                 ubis.append(ubi_rot)
+    if loginfo:
+        print(f'{len(ubis)} UBI guesses (flipmats):\n')
+        for ubi in ubis:
+            print(f'{ubi}\n')
             
     # compute scores for all ubi candidates
     for i, ubi in enumerate(ubis):
@@ -728,8 +751,14 @@ def pixel_ubi_fit(args, loginfo=False):
         stats[key] = np.array(stats[key])
     
     # select best ubi: maximizes score_global
-    best     = np.argmax(stats['score_global'])
-    best_ubi = ubis[best] 
+    try:
+        best     = np.nanargmax(stats['score_global'])
+        best_ubi = ubis[best]
+    except ValueError as e:  
+        # return default if refinement failed for all ubis in the list
+        if loginfo:
+            print(f'px {px}: {e}')
+        return default_output
     
     # Refine best ubi. Use merged HKLs. 2-stage refinement
     ###########################################################################   
@@ -806,7 +835,7 @@ def get_grain_props(UBI):
         return np.zeros((3,3)), np.zeros(6)
  
  
-def update_xmap(xmap, xyi_selec, results, pname, drlv2_max = 0.1, overwrite = True):
+def update_xmap(xmap, xyi_selec, results, pname, drlv2_max = 0.1, overwrite = True, loginfo=False):
     """ write indexing outputs in xmap. updates only pixels corresponding to the indexed phase. Also reset pixels to "notindexed" if no
     orientation has been found or if indexing scores are too bad (nindx < nindx_min, drlv2 > drlv2_max
     
@@ -840,8 +869,12 @@ def update_xmap(xmap, xyi_selec, results, pname, drlv2_max = 0.1, overwrite = Tr
         
         if overwrite:
             # reset all pixels for the selected phase
-            sel = xmap.phase_ids == pid
+            sel = xmap.get_phase_mask(pname)
             xmap.update_pixels(n, ary[sel], xyi_indx = xmap.xyi[sel])
+
+    if loginfo:
+        print(f'keys: {len(results.keys())}; xyi_uniqs:{len(xyi_selec)}') 
+        
     
     # update xmap with results
     #####################################################################

@@ -90,10 +90,15 @@ class Pixelmap:
 
     def to_tensor_map(self):
         """ export xmap data columnbs to ImageD11.sinograms.tensor_map"""
+        # export phases
         phase_dict = self.phases.as_dict()
         phase_dict_tmap = {cs.phase_id:cs.to_ImageD11_unitcell() for cs in phase_dict.values()}
-        
+
+        # get xmap as a grid
         xmap_g = self.as_grid()
+        isnan = np.isnan(np.linalg.det(xmap_g.U))
+        xmap_g.phase_ids[isnan] = -1
+        
         tmap = tensor_map.TensorMap(maps={t:xmap_g.get(t)[np.newaxis,...] for t in xmap_g.titles()},
                                     phases = phase_dict_tmap)
         tmap.get_ipf_maps()
@@ -559,7 +564,9 @@ class Pixelmap:
             gm = self.grain_ids==i
             
             # compute mean grain orientation (use quaternion space for this) and return it as a matrix U_g
-            ori_gi_mask = oq.Orientation.from_matrix(self.get(Ucol)[pm*gm*isUBI], symmetry = sym)
+            U = self.get(Ucol).copy()
+            U[np.isnan(U)] = 0    # nan cause issues with np.linalg
+            ori_gi_mask = oq.Orientation.from_matrix(U[pm*gm*isUBI], symmetry = sym)
             ori_mean = ori_gi_mask.mean()
             ori_mean.symmetry = cs.orix_phase.point_group.laue
             ori_mean = ori_mean.map_into_symmetry_reduced_zone()

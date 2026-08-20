@@ -818,8 +818,13 @@ def update_geometry_fpairs(cf, ds=None, add_xyz_lab=False, relocate_fpairs=True)
     tantth2  = np.tan(np.radians(tth_non_corr[1::2]))
 
     xl = xyz_corr_full[::2,0]
-    if ds is not None and 'frelon' in ds.detector:
-        xl = xl/1000  # dty is given in mm with the Frelon. Divide xl to match units 
+
+    if hasattr(ds, 'y0'):
+        y0 = ds.y0
+    elif y0 is None:
+        y0 = 0.5 * (ds.ymax + ds.ymin)
+    if ds is not None and ds.dtymotor=='diffty':
+        xl /= 1000  # diffty motor pos is in mm
     dx = np.sign(xl) * xl * (tantth1-tantth2)/(tantth1+tantth2)
     dx = utils.recast(dx)
     
@@ -843,9 +848,14 @@ def update_geometry_fpairs(cf, ds=None, add_xyz_lab=False, relocate_fpairs=True)
     ys = -so*dx + co*dy
 
     # add data columns 
-    cf.addcolumn(xs, 'xs')
-    cf.addcolumn(ys, 'ys')
+    cf.addcolumn(xs, 'sx')
+    cf.addcolumn(ys, 'sy')
     cf.addcolumn(r_dist, 'r_dist')
+
+    assert np.allclose(cf.sx, xs), 'xs inconsistent'
+    assert np.allclose(cf.sy, ys), 'ys inconsistent'
+
+    return dx, dy, o
 
     
     

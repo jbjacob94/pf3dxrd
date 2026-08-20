@@ -452,6 +452,52 @@ def compute_tth_histogram(cf, tthcol='tth', tthmin=0, tthmax=20, tthstep = 0.001
     return hist, bincens, binedges
 
 
+def compute_histogram(cf, datacol='tth', minval=0, maxval=20, step_size = 0.001, mask=None,
+                          weight_by_intensity = True, doplot=False, density=False, **kwargs):
+    """
+    compute histogram of two-theta, d*, or anything else, over the selected range, weighted by intensity
+    cf : columnfile
+    ds : dataset file
+    minval, maxval: range over which histogram is computed
+    step_size : bin width
+    mask: selection mask for data in histogram. default is None
+    datacol (str) : column name.
+    uself (bool)   : use 
+    density : use density for histogram
+    kwargs: kwargs to pass for plotting
+    
+    Return:
+    histogram, bincens, binedges
+    """
+    if mask is None:
+        m = np.full(cf.nrows, True)
+    else:
+        m = mask
+    
+    # select tth col + range
+    data = cf.getcolumn(datacol)
+    msk = np.all([data <= maxval, data >= minval, m], axis=0)
+    data_sel = data[msk]
+    
+    #Lorentz factor for intensity correction:  L( theta,eta ) = sin( 2*theta )*|sin( eta )| (Poulsen 2004) 
+    if weight_by_intensity:
+        weights = cf.sum_intensity[msk] * (np.exp( cf.ds[msk]*cf.ds[msk]*0.2 ) )
+        lf = refinegrains.lf(data_sel, cf.eta[msk])
+        weights *= lf
+    else:
+        weights = np.ones(cf.nrows, dtype=float)
+        
+    hist, binedges = np.histogram(data_sel, weights=weights, bins=np.arange(minval, maxval, step_size), density=density)
+    bincens = binedges[1:] - step_size / 2
+    
+    if doplot:
+        fig = pl.figure(figsize=(10,5))
+        pl.plot(bincens, hist, **kwargs)
+        pl.xlabel(datacol)
+             
+    return hist, bincens, binedges
+
+
 def split_xy_chunks(cf,ds, nx, ny, doplot=True):
     """ Split peakfile into rectangular chunks using (xs,ys) coordinates in sample reference frame. 
     Args:

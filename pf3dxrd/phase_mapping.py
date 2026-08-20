@@ -113,14 +113,11 @@ class PhaseMapper:
             self.pnames = []
             self.pids = []
            
-        
         def __str__(self):
             return f"phases: {self.pname}"
         
-        
         def get(self,attr):
             return self.__getattribute__(attr)
-            
             
         def add_phase(self, pname, cs):
             """ add phase to pixelmap.phases. 
@@ -433,6 +430,47 @@ class PhaseMapper:
             stats_dict[t].append(Ints_frac)
                            
         self.stats_labeled_peaks = stats_dict
+
+
+    def plot_ds_histogram(self, minval=0, maxval=2, step_size = 0.001,
+                            show_theoryds = True, mask=None):
+            
+        """
+        plot histogram of d* over the selected range 
+        
+        Args:
+        -------
+        minval, maxval     : range over which histogram is computed
+        step_size          : increment fro 2-theta bins
+        show_non_corrected : if True, alqo plots histogram of non-corrected ds
+        show_theory,       : if True, add ticks marking the position of computed Bragg peaks for each phase
+        mask (bool)        : custom boolean mask to select a subset of peaks in peakfile. must be the same length as columns in peakfile 
+        """ 
+            
+            
+        fig = pl.figure(figsize=(10,5))
+            
+        # tth plot
+        h, b, _ = utils.compute_histogram(self.peakfile, datacol='ds', minval=minval, maxval=maxval, step_size=step_size, mask=mask,
+                          weight_by_intensity = True, doplot=False, density=False)
+            
+        pl.plot(b, h, '-', lw=.8, label='d* histogram')
+            
+        # add theoretical Bragg peaks from stored phases
+        if show_theoryds:
+            colors = pl.matplotlib.cm.tab10.colors
+            
+            for i, pname in enumerate(self.phases.pnames):
+                cs = self.phases.get(pname)
+                wl = self.peakfile.parameters.get('wavelength')
+                theory_tth = np.asarray(cs.strong_peaks[0])
+                theory_ds = 2/wl * np.sin(np.deg2rad(theory_tth/2))
+                pl.vlines(theory_ds, ymin=-0.1 * h.max(), ymax=0, colors = colors[i+2], label=cs.name)
+                
+        pl.legend(loc='upper left')
+        pl.xlabel('d-star')
+        pl.ylabel('probability density')
+        pl.xlim(minval, maxval)
     
     
         
@@ -572,8 +610,8 @@ def _best_phase_match_worker(px):
     cf = _GLOBALS["peakfile"]
     phases = _GLOBALS["phases"]
     kernel_size = _GLOBALS["kernel_size"]
-    minpks = _GLOBALS["minpks"]
-    min_confidence = _GLOBALS["min_confidence"]
+    global_minpks = _GLOBALS["minpks"]
+    global_min_confidence = _GLOBALS["min_confidence"]
 
     # Default output for px if no best match can be found
     default_output = -1, 0, 0, 0, []
@@ -581,6 +619,16 @@ def _best_phase_match_worker(px):
     pnames = phases.pnames
     pids = phases.pids
     n = len(pnames)
+    # custom minpks/min_completeness per phase: per-phase setup in crystal_structure obj.
+    # use custom values if attribute is present in cs, otherwise stick to global values
+    minpks = [phases.get(p).minpks
+              if hasattr(phases.get(p), 'minpks') else global_minpks
+              for p in phases.pnames
+             ]
+    min_completeness = [phases.get(p).min_completeness
+                      if hasattr(phases.get(p), 'min_completeness') else global_min_confidence
+                      for p in phases.pnames
+                      ]
     
     # --- Peak selection ---
     s = peak_mapping.pks_from_px(cf.xyi, px, kernel_size=kernel_size)
@@ -591,7 +639,7 @@ def _best_phase_match_worker(px):
 
     # --- Filter by minpks ---
     npk = np.array([np.count_nonzero(cf.getcolumn(p)[s]) for p in pnames])
-    if max(npk) < minpks:
+    if max(npk) < global_minpks:
         return default_output
 
     # --- Compute intensities ---
@@ -601,8 +649,15 @@ def _best_phase_match_worker(px):
     ])
     sum_I_px = np.sum(cf.norm_intensity[s])
 
+     # --- completeness and uniqueness scores ---
     completeness = sum_I_ki / sum_I_px
     uniqueness = sum_I_ki_no_overlap / sum_I_ki
+
+    # --- phase-specific minpks / compl threshold ---
+    # discard any phase that does not pass these custom thresholds
+    for i, c in enumerate(completeness):
+        if (c < min_completeness[i]) or (npk[i] < minpks[i]):
+            completeness[i] = np.nan
     
     # --- Handle NaNs ---
     if np.all(np.isnan(completeness)):
@@ -620,7 +675,7 @@ def _best_phase_match_worker(px):
     else:
         conf_ind_best = (1 / (n - 1)) * (n * c_best - 1) * u_best
 
-    if conf_ind_best < min_confidence:
+    if conf_ind_best < global_min_confidence:
         return default_output
 
     # --- Collect peak indices ---
